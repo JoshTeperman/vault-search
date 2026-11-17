@@ -1,0 +1,381 @@
+#!/usr/bin/env python3
+"""Check externally visible vault-search criteria from a tailnet node.
+
+Configuration is by environment (or matching CLI flags). This repository
+holds placeholders only; fill real values in the shell, never commit them.
+
+    PUBLIC_BASE_URL              https://<vps>.<tailnet>.ts.net
+    MCP_PATH                     /vault/mcp   (default)
+    PUBLIC_IP                    public IPv4 or IPv6 of the VPS (optional)
+    VERIFY_FIXTURE_PATH          path argument to read_note (optional)
+    VERIFY_SYNTHETIC_SECRET      raw fixture token, assembled at runtime (optional)
+    MCP_PROTOCOL_VERSION         default 2026-07-28
+
+On-box checks (systemd, ss, Funnel, the audit log) are not performed here.
+Vault Keeper runs those over Tailscale SSH. This script is not acceptance
+on its own; it is the externally visible half of the completion criteria.
+
+Exit 0 if every requested check passed, 1 if any failed, 2 on usage errors.
+Never prints secret values.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+from typing import Any
+
+EXPECTED_TOOLS = ("search", "read_note", "list_notes", "list_projects")
+DEFAULT_MCP_PATH = "/vault/mcp"
+DEFAULT_PROTOCOL = "2026-07-28"
+DEFAULT_TIMEOUT = 15
+PUBLIC_IP_TIMEOUT = 5
+
+# JSON-RPC / SSE helpers are split out so tests can drive them without a network.
+
+
+def _env(name: str, default: str | None = None) -> str | None:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    return value
+
+
+def mcp_url(base_url: str, mcp_path: str) -> str:
+    return base_url.rstrip("/") + (mcp_path if mcp_path.startswith("/") else "/" + mcp_path)
+
+
+def parse_rpc_body(body: str, content_type: str = "") -> dict[str, Any]:
+    """Parse a JSON-RPC object from a JSON body or a simple SSE stream."""
+    text = body.strip()
+    if not text:
+        raise ValueError("empty response")
+    ctype = content_type.lower()
+    if "text/event-stream" in ctype or text.startswith("event:") or "\ndata:" in text or text.startswith("data:"):
+        payloads = []
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if line.startswith("data:"):
+                data = line[5:].strip()
+                if data and data != "[DONE]":
+                    payloads.append(json.loads(data))
+        if not payloads:
+            raise ValueError("SSE stream had no data payloads")
+        return payloads[-1]
+    return json.loads(text)
+
+
+def rpc_error_message(payload: dict[str, Any]) -> str | None:
+    error = payload.get("error")
+    if not error:
+        return None
+    if isinstance(error, dict):
+        return str(error.get("message") or error)
+    return str(error)
+
+
+def tool_names(payload: dict[str, Any]) -> list[str]:
+    result = payload.get("result") or {}
+    tools = result.get("tools") or []
+    names = []
+    for tool in tools:
+        if isinstance(tool, dict) and tool.get("name"):
+            names.append(str(tool["name"]))
+    return names
+
+
+def text_from_tool_result(payload: dict[str, Any]) -> str:
+    """Flatten MCP tools/call text content; also accept a bare markdown result."""
+    result = payload.get("result")
+    if result is None:
+        return ""
+    if isinstance(result, str):
+        return result
+    if not isinstance(result, dict):
+        return json.dumps(result)
+    parts: list[str] = []
+    content = result.get("content")
+    if isinstance(content, list):
+        for item in content:
+            if isinstance(item, dict) and item.get("type") in (None, "text"):
+                parts.append(str(item.get("text") or ""))
+            elif isinstance(item, str):
+                parts.append(item)
+    if not parts and "text" in result:
+        parts.append(str(result["text"]))
+    if not parts:
+        return json.dumps(result)
+    return "\n".join(parts)
+
+
+def masking_ok(body: str, secret: str) -> tuple[bool, str]:
+    """Return (ok, reason). The reason never includes the secret."""
+    if not secret:
+        return False, "synthetic secret was empty"
+    if secret in body:
+        return False, "response contained the synthetic secret (unmasked)"
+    if "[REDACTED:" not in body and "[redacted:" not in body.lower():
+        return False, "response did not contain a [REDACTED:...] placeholder"
+    return True, "response is masked and the synthetic secret is absent"
+
+
+def public_ip_url(public_ip: str, mcp_path: str) -> str:
+    host = public_ip.strip()
+    if ":" in host and not host.startswith("["):
+        # IPv6
+        host = f"[{host}]"
+    path = mcp_path if mcp_path.startswith("/") else "/" + mcp_path
+    return f"https://{host}{path}"
+
+
+class CheckResult:
+    def __init__(self, name: str, ok: bool, detail: str) -> None:
+        self.name = name
+        self.ok = ok
+        self.detail = detail
+
+    def line(self) -> str:
+        status = "PASS" if self.ok else "FAIL"
+        return f"{status}  {self.name}: {self.detail}"
+
+
+def post_rpc(
+    url: str,
+    payload: dict[str, Any],
+    *,
+    timeout: float,
+    session_id: str | None = None,
+) -> tuple[dict[str, Any], str | None, int]:
+    data = json.dumps(payload).encode("utf-8")
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+    }
+    if session_id:
+        headers["Mcp-Session-Id"] = session_id
+    request = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+            ctype = response.headers.get("Content-Type") or ""
+            sid = response.headers.get("Mcp-Session-Id") or response.headers.get("mcp-session-id")
+            return parse_rpc_body(raw, ctype), sid, response.status
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        ctype = exc.headers.get("Content-Type") if exc.headers else ""
+        try:
+            parsed = parse_rpc_body(raw, ctype or "")
+        except (ValueError, json.JSONDecodeError):
+            raise RuntimeError(f"HTTP {exc.code} from {url}") from exc
+        sid = exc.headers.get("Mcp-Session-Id") if exc.headers else None
+        return parsed, sid, exc.code
+
+
+def check_initialize_and_tools(
+    url: str, *, protocol: str, timeout: float
+) -> tuple[list[CheckResult], str | None]:
+    results: list[CheckResult] = []
+    session_id = None
+    try:
+        init_payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": protocol,
+                "capabilities": {},
+                "clientInfo": {"name": "vault-search-verify", "version": "0.1.0"},
+            },
+        }
+        init_body, session_id, _status = post_rpc(url, init_payload, timeout=timeout)
+    except Exception as exc:
+        results.append(CheckResult("initialize", False, f"request failed: {exc}"))
+        return results, None
+    err = rpc_error_message(init_body)
+    if err:
+        results.append(CheckResult("initialize", False, f"JSON-RPC error: {err}"))
+        return results, session_id
+    if "result" not in init_body:
+        results.append(CheckResult("initialize", False, "response had no result"))
+        return results, session_id
+    results.append(CheckResult("initialize", True, "JSON-RPC result received"))
+
+    try:
+        list_body, _sid, _status = post_rpc(
+            url,
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+            timeout=timeout,
+            session_id=session_id,
+        )
+    except Exception as exc:
+        results.append(CheckResult("tools/list", False, f"request failed: {exc}"))
+        return results, session_id
+    err = rpc_error_message(list_body)
+    if err:
+        results.append(CheckResult("tools/list", False, f"JSON-RPC error: {err}"))
+        return results, session_id
+    names = tool_names(list_body)
+    if tuple(names) == EXPECTED_TOOLS or set(names) == set(EXPECTED_TOOLS):
+        results.append(
+            CheckResult("tools/list", True, "tools: " + ", ".join(names))
+        )
+    else:
+        results.append(
+            CheckResult(
+                "tools/list",
+                False,
+                "expected {0}, got {1}".format(
+                    ", ".join(EXPECTED_TOOLS),
+                    ", ".join(names) or "(none)",
+                ),
+            )
+        )
+    return results, session_id
+
+
+def check_masked_fixture(
+    url: str,
+    *,
+    fixture_path: str,
+    secret: str,
+    timeout: float,
+    session_id: str | None,
+) -> CheckResult:
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "tools/call",
+        "params": {"name": "read_note", "arguments": {"path": fixture_path}},
+    }
+    try:
+        body, _sid, _status = post_rpc(url, payload, timeout=timeout, session_id=session_id)
+    except Exception as exc:
+        return CheckResult("masked fixture", False, f"request failed: {exc}")
+    err = rpc_error_message(body)
+    if err:
+        return CheckResult("masked fixture", False, f"JSON-RPC error: {err}")
+    text = text_from_tool_result(body)
+    ok, reason = masking_ok(text, secret)
+    return CheckResult("masked fixture", ok, reason)
+
+
+def check_public_ip_unreachable(public_ip: str, mcp_path: str, timeout: float) -> CheckResult:
+    url = public_ip_url(public_ip, mcp_path)
+    request = urllib.request.Request(url, method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            status = response.status
+            # Any successful HTTP response from the public IP is a failure of the check.
+            return CheckResult(
+                "public IP unreachable",
+                False,
+                f"UNEXPECTED SUCCESS: HTTP {status} from the public address",
+            )
+    except urllib.error.HTTPError as exc:
+        return CheckResult(
+            "public IP unreachable",
+            False,
+            f"UNEXPECTED SUCCESS: HTTP {exc.code} from the public address",
+        )
+    except Exception as exc:
+        kind = type(exc).__name__
+        return CheckResult(
+            "public IP unreachable",
+            True,
+            f"failed as expected ({kind})",
+        )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Verify externally visible vault-search deploy criteria (run from a tailnet node)."
+    )
+    parser.add_argument(
+        "--base-url",
+        default=None,
+        help="PUBLIC_BASE_URL, e.g. https://<vps>.<tailnet>.ts.net",
+    )
+    parser.add_argument("--mcp-path", default=None, help="MCP_PATH (default /vault/mcp)")
+    parser.add_argument("--public-ip", default=None, help="PUBLIC_IP; skip the public-IP check if unset")
+    parser.add_argument("--fixture-path", default=None, help="VERIFY_FIXTURE_PATH for read_note")
+    parser.add_argument(
+        "--synthetic-secret",
+        default=None,
+        help="VERIFY_SYNTHETIC_SECRET (assembled at runtime; do not log)",
+    )
+    parser.add_argument("--protocol-version", default=None, help="MCP_PROTOCOL_VERSION")
+    parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    base = args.base_url or _env("PUBLIC_BASE_URL")
+    mcp_path = args.mcp_path or _env("MCP_PATH", DEFAULT_MCP_PATH)
+    public_ip = args.public_ip or _env("PUBLIC_IP")
+    fixture_path = args.fixture_path or _env("VERIFY_FIXTURE_PATH")
+    secret = args.synthetic_secret or _env("VERIFY_SYNTHETIC_SECRET")
+    protocol = args.protocol_version or _env("MCP_PROTOCOL_VERSION", DEFAULT_PROTOCOL)
+
+    if not base:
+        print(
+            "usage: set PUBLIC_BASE_URL (or --base-url) to https://<vps>.<tailnet>.ts.net",
+            file=sys.stderr,
+        )
+        return 2
+    assert mcp_path is not None and protocol is not None
+
+    url = mcp_url(base, mcp_path)
+    checks: list[CheckResult] = []
+    session_id = None
+
+    tool_checks, session_id = check_initialize_and_tools(
+        url, protocol=protocol, timeout=args.timeout
+    )
+    checks.extend(tool_checks)
+
+    if fixture_path or secret:
+        if not fixture_path or not secret:
+            checks.append(
+                CheckResult(
+                    "masked fixture",
+                    False,
+                    "set both VERIFY_FIXTURE_PATH and VERIFY_SYNTHETIC_SECRET, or neither",
+                )
+            )
+        else:
+            checks.append(
+                check_masked_fixture(
+                    url,
+                    fixture_path=fixture_path,
+                    secret=secret,
+                    timeout=args.timeout,
+                    session_id=session_id,
+                )
+            )
+
+    if public_ip:
+        checks.append(check_public_ip_unreachable(public_ip, mcp_path, PUBLIC_IP_TIMEOUT))
+    else:
+        print("SKIP  public IP unreachable: PUBLIC_IP not set")
+
+    failed = 0
+    for check in checks:
+        print(check.line())
+        if not check.ok:
+            failed += 1
+
+    print()
+    if failed:
+        print(f"{failed} check(s) failed. This script is not a substitute for on-box criteria.")
+        return 1
+    print("All requested external checks passed. On-box criteria still need an independent run.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

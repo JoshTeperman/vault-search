@@ -1,0 +1,48 @@
+# Environment and local secrets
+.env
+.env.*
+!.env.example
+
+# Local indexes and databases
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+index/
+*.index
+*.faiss
+
+# Model and embedding caches
+models/
+.cache/
+.embeddings/
+*.bin
+*.gguf
+*.onnx
+*.safetensors
+*.pt
+*.pth
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+htmlcov/
+
+# Tools / OS
+.DS_Store
+Thumbs.db
+*.swp
