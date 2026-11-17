@@ -12,7 +12,7 @@ https://<vps>.<tailnet>.ts.net/vault/mcp
 
 Those angle-bracket names are placeholders. Never substitute real host, tailnet, or address values into this repository.
 
-**Acceptance.** Every step below ends with checkable completion criteria (exact commands and expected results). Your report is necessary but not sufficient: Vault Keeper independently re-runs the externally visible checks from a tailnet-connected machine with `scripts/verify-deploy`, and the on-box checks over Tailscale SSH, before calling a milestone done.
+**Acceptance.** Every step below ends with checkable completion criteria (exact commands and expected results). Your report is necessary but not sufficient: Vault Keeper independently re-runs the externally visible checks from the shared Grok Bot box (the verification node) with `scripts/verify-deploy`, and the on-box checks over Tailscale SSH, before calling a milestone done.
 
 ## Safety rules
 
@@ -392,7 +392,7 @@ Expected:
 
 ## 8. Caller identity, audit log, and denylist
 
-The service records caller identity on every tool call and rejects callers who are not on the tailnet, or who are on the service denylist. WhoIs is the source of truth, because agents are typically **tagged nodes**, and **nginx does not inject Tailscale identity**.
+The service records caller identity on every tool call and rejects callers who are not on the tailnet, or who are on the service denylist. WhoIs identifies the **device**. **nginx does not inject Tailscale identity.** Tagged nodes are the later per-agent path; they are not how the shared Grok Bot box appears today.
 
 **`IDENTITY_SOURCE=whois`.** The app reads `X-Real-IP` or `X-Forwarded-For` (set by nginx from `$remote_addr`) only when the immediate TCP peer is `127.0.0.1`. It then looks up that client address on the local tailscaled socket:
 
@@ -402,6 +402,8 @@ curl --unix-socket /var/run/tailscale/tailscaled.sock \
 ```
 
 The response includes node name and tags, and a user profile when the node is not tagged. For tagged nodes, the login field is not a useful user identity (it is the tagged-devices profile); log the **node name and tags** instead. Do not paste WhoIs output that contains real names into git.
+
+**Identity v1 (as of 17 Nov 2026).** The shared Grok Bot box used by all of Josh's agents is on the tailnet through the Tailscale connector. It is a single **untagged** device carrying Josh's identity, meant for **read and verify only**, and it can reach tailnet hosts over HTTP(S)/TCP. WhoIs cannot tell agents on that box apart. Identity v1 is the device, plus a self-reported `X-Vault-Agent-Name` header. The audit log records the header when present and marks it **unverified**. The header is not used for authorisation or revocation. **Revocation is per device** (overlay ACL, device removal, or the service denylist). True per-agent identity comes later, from separate tagged devices or MCP OAuth through the gateway. This same box is Vault Keeper's verification node for the criteria in [End-to-end verification](#9-end-to-end-verification). Do not write real host or tailnet names in this repo.
 
 The service user must be able to read that socket (see [Service user and directories](#2-service-user-and-directories)). If a request has no trusted client IP, or WhoIs does not recognise it as a tailnet node, reject the call.
 
@@ -421,8 +423,8 @@ sudo tail -n 20 /var/log/vault-search/audit.log
 Expected:
 
 - A new line exists for the `initialize` or `tools/list` (and, if run, the fixture `read_note`/`search`) call.
-- The line includes a caller node name and tags (or a user login if the caller was not tagged).
-- The line does **not** contain secret values or vault body text. In the report, quote only outcome and whether identity was present — not a raw log dump, not WhoIs JSON.
+- The line includes a caller **device** identity (node name and tags, or a user login if the caller was not tagged). If `X-Vault-Agent-Name` was sent, the line includes it and marks it **unverified**.
+- The line does **not** contain secret values or vault body text. In the report, quote only outcome and whether identity was present — not a raw log dump, not WhoIs JSON, not real host names.
 
 ## 9. End-to-end verification
 
@@ -430,7 +432,7 @@ Expected:
 
 Run the on-box commands on the VPS. Run the HTTP commands (or `scripts/verify-deploy`) from a **different** node on the tailnet, and the public-IP curl from a host that is **not** on the tailnet. Do not commit commands with real names filled in.
 
-Claude's passing output is not acceptance. Vault Keeper re-runs these checks from a tailnet-connected machine with `scripts/verify-deploy` (externally visible criteria) and the on-box commands over Tailscale SSH.
+Claude's passing output is not acceptance. Vault Keeper re-runs these checks from the shared Grok Bot box (the verification node; untagged, Josh's identity, read/verify only — see [Caller identity](#8-caller-identity-audit-log-and-denylist)) with `scripts/verify-deploy` (externally visible criteria) and the on-box commands over Tailscale SSH.
 
 1. **systemd is active** (on the VPS):
 
@@ -535,7 +537,7 @@ Expected:
 
 Send the filled template privately (not as a commit to this repo). Do not include host names, tailnet names, IP addresses, `.env` values, private keys, tokens, vault note content, or raw audit/WhoIs dumps. If inventory names are needed, send them to Josh privately.
 
-This report is **not** acceptance. Vault Keeper re-runs the completion criteria from a tailnet-connected machine (`scripts/verify-deploy` for the externally visible checks, plus the on-box commands over Tailscale SSH) before calling the milestone done.
+This report is **not** acceptance. Vault Keeper re-runs the completion criteria from the shared Grok Bot box, which is the verification node (`scripts/verify-deploy` for the externally visible checks, plus the on-box commands over Tailscale SSH), before calling the milestone done.
 
 ```text
 ## Deploy report (vault-search)

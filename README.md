@@ -80,11 +80,15 @@ Caller identity is recorded on every call and used for the denylist. **`IDENTITY
 
 A caller that is not on the tailnet, or that is on the denylist, is rejected.
 
+**Identity v1 (as of 17 Nov 2026).** The shared Grok Bot box used by all of Josh's agents is on the tailnet through the Tailscale connector. It is a single **untagged** device carrying Josh's identity, meant for **read and verify only**, and it can reach tailnet hosts over HTTP(S)/TCP. WhoIs therefore cannot tell agents on that box apart: every call looks like the same user-owned node. Identity v1 is the **device** (WhoIs), plus a self-reported `X-Vault-Agent-Name` header. The audit log records the header when present and marks it **unverified**. The header is not used for authorisation or revocation. **Revocation is per device** (overlay ACL, device removal, or the service denylist). True per-agent identity comes later, from separate tagged devices or MCP OAuth through the gateway. Do not write real host or tailnet names in this repo.
+
+This same shared box is Vault Keeper's **verification node** for the [DEPLOY.md](DEPLOY.md) completion criteria. A report from the VPS deploy executor is not acceptance.
+
 ## Deploy
 
 Vault Keeper owns the code in this repository. Deployment on the VPS is done by pulling a release and following [DEPLOY.md](DEPLOY.md): service user, pull-only vault clone, loopback systemd unit, and an nginx `location /vault/mcp` in the on-box nginx git. The HTTP server itself is available from later milestones; the runbook marks those steps and gives checkable completion criteria for each one.
 
-Vault Keeper independently verifies a deploy from a tailnet-connected machine. A report from the VPS agent is not acceptance. For the externally visible checks (MCP `initialize` / `tools/list`, masked fixture query, public IP must fail):
+Vault Keeper independently verifies a deploy from the shared Grok Bot box (the verification node; see [Caller identity](#caller-identity-and-exposure)). A report from the VPS agent is not acceptance. For the externally visible checks (MCP `initialize` / `tools/list`, masked fixture query, public IP must fail):
 
 ```bash
 # Real values only in the shell, never committed.
