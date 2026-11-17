@@ -176,6 +176,13 @@ def test_generic_high_entropy_assignment() -> None:
     assert value not in mask(text)
 
 
+def test_redacted_placeholder_with_trailing_junk_is_not_flagged() -> None:
+    # SQLite pages can concatenate the next record onto a masked assignment.
+    text = "api_token = [REDACTED:generic_secret]Fixture"
+    assert scan(text) == []
+    assert mask(text) == text
+
+
 def test_generic_low_entropy_or_placeholder_not_flagged() -> None:
     samples = [
         "token=hello",

@@ -211,6 +211,9 @@ def _looks_placeholder(value: str) -> bool:
         return True
     if stripped.startswith("${") or stripped.startswith("$"):
         return True
+    # Masker output, including when a later record is concatenated in SQLite pages.
+    if stripped.startswith("[REDACTED:") or stripped.startswith("REDACTED:"):
+        return True
     return False
 
 

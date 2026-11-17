@@ -609,6 +609,14 @@ Claude's passing output is not acceptance. Vault Keeper re-runs these checks fro
 
 7. **Denylist** (once a test identity is available): adding a caller to `DENYLIST_PATH` and retrying should be rejected and audit-logged. Remove the test entry afterwards.
 
+8. **The built index contains no unmasked secrets** (on the VPS). This is an on-box check; `scripts/verify-deploy` does not run it, because that script only covers externally visible HTTP criteria.
+
+   ```bash
+   sudo -u vault-search /var/lib/vault-search/app/.venv/bin/python -m vault_search index-audit /var/lib/vault-search/index/vault.db
+   ```
+
+   Expected: exit code `0` and no output. Exit `1` means the detector found a secret-like span in a table, an FTS shadow table, or the raw database bytes (including WAL/journal sidecars). The command never prints the matched value. In the report, say only pass/fail and any rule names — do not paste findings or vault text.
+
 ### Completion criteria
 
 **Available from milestone 6.** This section is done when every item above has the expected result, **and** Vault Keeper has independently obtained the same result with `scripts/verify-deploy` plus the on-box checks. A report from Claude alone does not close the milestone.
@@ -627,6 +635,16 @@ sudo systemctl restart vault-search    # only once the unit is enabled
 ```
 
 Keep the v1 install keyword-only: do not add `[semantic]` on a routine update. If semantic search was already enabled, reinstall with `pip install -e "/var/lib/vault-search/app[semantic]"` instead so the extra is not dropped, then reindex if the model or schema changed.
+
+A schema-version change deletes the existing index file and its WAL/journal sidecars and rebuilds from scratch, so older unmasked rows cannot remain in free pages. After pulling a release that bumps the schema, rebuild the index **before** relying on the service, then audit the file:
+
+```bash
+sudo -u vault-search /var/lib/vault-search/app/.venv/bin/python -m vault_search index
+sudo -u vault-search /var/lib/vault-search/app/.venv/bin/python -m vault_search index-audit /var/lib/vault-search/index/vault.db
+sudo systemctl restart vault-search    # only once the unit is enabled
+```
+
+If the unit is restarted before that reindex, it will open an empty rebuilt file and searches will return nothing until `python -m vault_search index` or the sync timer runs.
 
 Re-run [section 9](#9-end-to-end-verification). If the unit is not yet enabled (pre-milestone 6), skip the restart.
 
@@ -672,6 +690,7 @@ Funnel (expected: off):
 
 MCP initialize / tools/list (pass/fail; list tool names only):
 Masked fixture query (pass/fail; say whether [REDACTED:] appeared; do not paste the secret):
+Index audit (`python -m vault_search index-audit`; pass/fail; rule names only, no findings dump):
 Public IP curl (failed as expected / UNEXPECTED SUCCESS):
 Audit log: caller identity present (yes/no; node/tags or user; no log dump):
 

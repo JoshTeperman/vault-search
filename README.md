@@ -14,7 +14,7 @@ This repository holds the search interface, the shared secret detector, a local 
 
 ## Tool contract
 
-All tools are read-only. Every response is run through the secret masker. Results are compact markdown (path, title, heading breadcrumb, projects/tags, snippet) rather than raw JSON. There are no ids, raw scores, or UUIDs.
+All tools are read-only. Every text field is secret-masked before it is written to the index, and every response is masked again on the way out. Results are compact markdown (path, title, heading breadcrumb, projects/tags, snippet) rather than raw JSON. There are no ids, raw scores, or UUIDs.
 
 The Python API (`Client`) is what the MCP server wraps. The v1 deploy does not install embeddings, so search is keyword (full-text) only. The API default `mode=hybrid` fuses full-text with local semantic search (RRF, k=60) **when embeddings exist**; if the `[semantic]` extra is not installed, or the index has no vectors, `hybrid` and `semantic` fall back to full-text. `mode=fulltext` and `mode=semantic` remain explicit overrides. Filters apply to every mode. Do not treat a hybrid fallback as a semantic result.
 
@@ -61,7 +61,7 @@ Copy `.env.example` to `.env` when running locally. Never commit `.env` or any f
 
 **No vault content in this repo.** Notes, search indexes, model caches, and `.env` files are gitignored. Tests use synthetic fixtures, not vault pages. Documentation uses placeholder names only.
 
-**Secrets must never be stored in the vault.** This repo is the home of the shared detector. Vault ingest lint should call the same `scan` API (pin a release, or vendor a copy). The service also masks every read and search result, which is defence in depth, not a licence to store secrets.
+**Secrets must never be stored in the vault.** This repo is the home of the shared detector. Vault ingest lint should call the same `scan` API (pin a release, or vendor a copy). The indexer runs every text field through `mask` before writing it to SQLite (body, chunks, FTS, titles, breadcrumbs, front matter, and tags). Optional embeddings are computed from that already-masked text. Query output is masked again as a second layer. This is defence in depth, not a licence to store secrets.
 
 **Detector API and CLI**
 
@@ -77,6 +77,14 @@ python -m vault_search.secrets scan <paths>
 ```
 
 The command exits `1` when it reports a finding, `0` when the paths are clean, and `2` on usage or missing-path errors. Output is `path:line:column: rule`. Matched values are never printed. A `mask` subcommand reads stdin and writes redacted text to stdout.
+
+After building an index, scan the database itself (SQL text, FTS shadow tables, and raw file bytes, including WAL/journal sidecars):
+
+```bash
+python -m vault_search index-audit /path/to/index.db
+```
+
+The same exit codes apply. The command never prints matched values. A schema-version mismatch deletes the existing index file and rebuilds it from scratch so older unmasked rows cannot remain in free pages.
 
 Rules cover common token formats (GitHub, OpenAI, Anthropic, AWS, Slack, Google), JWTs, private-key blocks, and high-entropy `key=` / `token=` (and similar) assignments.
 
@@ -134,6 +142,7 @@ python -m vault_search list-projects
 python -m vault_search sync          # git pull --ff-only at VAULT_ROOT, then reindex
 python -m vault_search.mcp           # Streamable HTTP on 127.0.0.1 (or `vault_search serve`)
 python -m vault_search.secrets scan .
+python -m vault_search index-audit index/vault.db
 ```
 
 ## Milestones
@@ -141,7 +150,7 @@ python -m vault_search.secrets scan .
 1. **Public repo and secret scanner** — done. Detector, tests, CI, pre-commit, deploy runbook.
 2. **Access and inventory** — blocked on VPS access.
 3. **Pull-only vault sync on the VPS** — blocked on VPS access.
-4. **Index and CLI** — done in this tree. SQLite FTS5 over `wiki/`, heading chunks, backlinks, compact masked markdown, incremental reindex.
+4. **Index and CLI** — done in this tree. SQLite FTS5 over `wiki/`, heading chunks, backlinks, compact masked markdown, ingest-time secret masking, incremental reindex.
 5. **Hybrid search** — done in this tree, optional. The v1 deploy is keyword-only (no `[semantic]` extra). Installing `fastembed` (`BAAI/bge-small-en-v1.5`, ONNX, CPU) and reindexing attaches vectors to `chunk_embeddings` and turns on RRF hybrid (k=60).
 6. **MCP server** — done in this tree (loopback Streamable HTTP, WhoIs identity, denylist, audit log, `scripts/verify-deploy`). Binding it to the VPS tailnet is still blocked on VPS access; see [DEPLOY.md](DEPLOY.md).
 7. **Adapter-ready** — tool contract documented for a future gateway; no other data sources.
@@ -155,6 +164,7 @@ python -m pip install -e ".[dev]"
 python -m pip install -e ".[semantic]"   # optional; not part of the v1 deploy
 python -m pytest -q
 python -m vault_search.secrets scan .
+python -m vault_search index-audit index/vault.db   # after building a local index
 ```
 
 A GitHub Actions workflow runs the tests and [gitleaks](https://github.com/gitleaks/gitleaks) on push and pull request. To run the same hook locally:

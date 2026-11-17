@@ -1,19 +1,27 @@
-"""SQLite FTS5 index over a vault checkout. Incremental, no vault content in git."""
+"""SQLite FTS5 index over a vault checkout. Incremental, no vault content in git.
+
+Every text value is secret-masked at a single write choke point before it is
+stored. A schema-version mismatch deletes the database file and sidecars and
+rebuilds them, so older unmasked rows cannot remain in free pages.
+"""
 
 from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 import subprocess
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
 from vault_search.config import Settings
 from vault_search.parse import ParsedNote, parse_note
+from vault_search.secrets import mask as mask_secrets
 
-SCHEMA_VERSION = "5"
+SCHEMA_VERSION = "6"
 
 SCHEMA = """
 PRAGMA foreign_keys = ON;
@@ -155,7 +163,44 @@ def iter_note_paths(root: Path, *, include_raw: bool, include_examples: bool) ->
     return paths
 
 
+def store_text(value: str) -> str:
+    """Mask secret-like spans before text is written to the index.
+
+    This is the only function that may prepare a string for a SQLite write.
+    Callers must bind text through ``execute_write`` or ``store_text`` itself.
+    Output masking in the query layer is a second line of defence, not a
+    substitute for this step.
+    """
+    return mask_secrets(value)
+
+
+_WRITE_SQL = re.compile(r"^\s*(INSERT|UPDATE|REPLACE|DELETE)\b", re.IGNORECASE)
+
+
+def execute_write(
+    conn: sqlite3.Connection, sql: str, params: Sequence[object] = ()
+) -> sqlite3.Cursor:
+    """Run a write statement after passing every string parameter through store_text."""
+    if not _WRITE_SQL.match(sql):
+        raise ValueError("execute_write accepts only INSERT, UPDATE, REPLACE, or DELETE")
+    bound = tuple(store_text(param) if isinstance(param, str) else param for param in params)
+    return conn.execute(sql, bound)
+
+
+def index_sidecar_paths(index_path: Path) -> tuple[Path, ...]:
+    """Return the main database path plus WAL, SHM, and journal sidecars."""
+    name = str(index_path)
+    return (index_path, Path(name + "-wal"), Path(name + "-shm"), Path(name + "-journal"))
+
+
+def remove_index_files(index_path: Path) -> None:
+    """Delete the index database and any sidecar files if they exist."""
+    for path in index_sidecar_paths(index_path):
+        path.unlink(missing_ok=True)
+
+
 def connect(index_path: Path) -> sqlite3.Connection:
+    index_path = index_path.expanduser().resolve()
     index_path.parent.mkdir(parents=True, exist_ok=True)
     # check_same_thread=False: the MCP server may call the shared Client from
     # worker threads. Writes still go through reindex; readers are concurrent
@@ -174,37 +219,47 @@ def _meta(conn: sqlite3.Connection, key: str) -> str | None:
 
 
 def _set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
-    conn.execute(
+    execute_write(
+        conn,
         "INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         (key, value),
     )
 
 
-def ensure_schema(conn: sqlite3.Connection) -> None:
+def _create_fresh_index(index_path: Path) -> sqlite3.Connection:
+    """Write a new empty database file with the current schema."""
+    remove_index_files(index_path)
+    conn = connect(index_path)
+    conn.executescript(SCHEMA)
+    conn.executescript(FTS_CREATE)
+    _set_meta(conn, "schema_version", SCHEMA_VERSION)
+    conn.commit()
+    return conn
+
+
+def ensure_schema(conn: sqlite3.Connection) -> sqlite3.Connection:
+    """Rebuild the index from a new file if the schema version does not match.
+
+    Returns a (possibly new) connection. When a rebuild is required, the
+    input connection is closed and the database file plus sidecars are
+    deleted so no unmasked text can remain in free pages or WAL leftovers.
+    """
     current = None
     try:
         current = _meta(conn, "schema_version")
     except sqlite3.OperationalError:
         current = None
     if current == SCHEMA_VERSION:
-        return
-    # Rebuild empty schema when the version changes.
-    conn.executescript(
-        """
-        PRAGMA foreign_keys = OFF;
-        DROP TABLE IF EXISTS chunk_embeddings;
-        DROP TABLE IF EXISTS chunks_fts;
-        DROP TABLE IF EXISTS links;
-        DROP TABLE IF EXISTS chunks;
-        DROP TABLE IF EXISTS notes;
-        DROP TABLE IF EXISTS meta;
-        PRAGMA foreign_keys = ON;
-        """
-    )
-    conn.executescript(SCHEMA)
-    conn.executescript(FTS_CREATE)
-    _set_meta(conn, "schema_version", SCHEMA_VERSION)
-    conn.commit()
+        return conn
+    row = conn.execute("PRAGMA database_list").fetchone()
+    index_path = Path(row["file"] if isinstance(row, sqlite3.Row) else row[2])
+    conn.close()
+    return _create_fresh_index(index_path)
+
+
+def open_index(index_path: Path) -> sqlite3.Connection:
+    """Connect and ensure the current schema, rebuilding the file if needed."""
+    return ensure_schema(connect(index_path))
 
 
 def _source_for(rel: str) -> str:
@@ -214,12 +269,13 @@ def _source_for(rel: str) -> str:
 
 
 def _delete_note(conn: sqlite3.Connection, path: str) -> None:
-    ids = [row["id"] for row in conn.execute("SELECT id FROM chunks WHERE path = ?", (path,))]
+    stored = store_text(path)
+    ids = [row["id"] for row in conn.execute("SELECT id FROM chunks WHERE path = ?", (stored,))]
     for chunk_id in ids:
-        conn.execute("DELETE FROM chunks_fts WHERE rowid = ?", (chunk_id,))
-    conn.execute("DELETE FROM links WHERE src_path = ?", (path,))
-    conn.execute("DELETE FROM chunks WHERE path = ?", (path,))
-    conn.execute("DELETE FROM notes WHERE path = ?", (path,))
+        execute_write(conn, "DELETE FROM chunks_fts WHERE rowid = ?", (chunk_id,))
+    execute_write(conn, "DELETE FROM links WHERE src_path = ?", (stored,))
+    execute_write(conn, "DELETE FROM chunks WHERE path = ?", (stored,))
+    execute_write(conn, "DELETE FROM notes WHERE path = ?", (stored,))
 
 
 def _upsert_note(
@@ -231,7 +287,8 @@ def _upsert_note(
     sha256: str,
 ) -> int:
     _delete_note(conn, note.path)
-    conn.execute(
+    execute_write(
+        conn,
         """
         INSERT INTO notes(
             path, title, type, description, created, updated, status, source,
@@ -257,13 +314,15 @@ def _upsert_note(
         ),
     )
     for link in note.links:
-        conn.execute(
+        execute_write(
+            conn,
             "INSERT OR IGNORE INTO links(src_path, dest_stem, dest_path) VALUES (?, ?, NULL)",
             (note.path, link),
         )
     count = 0
     for chunk in note.chunks:
-        cursor = conn.execute(
+        cursor = execute_write(
+            conn,
             """
             INSERT INTO chunks(path, ordinal, heading, breadcrumb, level, start_line, end_line, text)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -280,7 +339,8 @@ def _upsert_note(
             ),
         )
         chunk_id = cursor.lastrowid
-        conn.execute(
+        execute_write(
+            conn,
             "INSERT INTO chunks_fts(rowid, text, title, breadcrumb, path) VALUES (?, ?, ?, ?, ?)",
             (chunk_id, chunk.text, note.title, chunk.breadcrumb, note.path),
         )
@@ -296,7 +356,8 @@ def _resolve_links(conn: sqlite3.Connection) -> None:
         stems.setdefault(stem, row["path"])
     for row in conn.execute("SELECT src_path, dest_stem FROM links"):
         dest = stems.get(row["dest_stem"])
-        conn.execute(
+        execute_write(
+            conn,
             "UPDATE links SET dest_path = ? WHERE src_path = ? AND dest_stem = ?",
             (dest, row["src_path"], row["dest_stem"]),
         )
@@ -305,8 +366,7 @@ def _resolve_links(conn: sqlite3.Connection) -> None:
 class Index:
     def __init__(self, settings: Settings):
         self.settings = settings
-        self.conn = connect(settings.index_path)
-        ensure_schema(self.conn)
+        self.conn = open_index(settings.index_path)
 
     def close(self) -> None:
         self.conn.close()
@@ -373,7 +433,8 @@ class Index:
                     continue
                 digest = file_sha256(path)
                 if not force and prior is not None and prior["sha256"] == digest:
-                    self.conn.execute(
+                    execute_write(
+                        self.conn,
                         "UPDATE notes SET mtime_ns = ?, size = ? WHERE path = ?",
                         (stat.st_mtime_ns, stat.st_size, rel),
                     )
@@ -442,7 +503,7 @@ def _sync_embeddings(conn: sqlite3.Connection, embedder: object) -> int:
 
     model = embedder.model_name  # type: ignore[attr-defined]
     dim = int(embedder.dim)  # type: ignore[attr-defined]
-    conn.execute("DELETE FROM chunk_embeddings WHERE model != ?", (model,))
+    execute_write(conn, "DELETE FROM chunk_embeddings WHERE model != ?", (model,))
     rows = conn.execute(
         """
         SELECT c.id, n.title, c.breadcrumb, c.text
@@ -468,7 +529,8 @@ def _sync_embeddings(conn: sqlite3.Connection, embedder: object) -> int:
             raise RuntimeError("embedder returned a different number of vectors than inputs")
         for row, vector in zip(batch, vectors, strict=True):
             packed = pack_vector(l2_normalize(vector))
-            conn.execute(
+            execute_write(
+                conn,
                 """
                 INSERT OR REPLACE INTO chunk_embeddings (chunk_id, model, dim, embedding)
                 VALUES (?, ?, ?, ?)

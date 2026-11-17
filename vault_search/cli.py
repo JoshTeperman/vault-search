@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -63,6 +64,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sync_p.add_argument("--force", action="store_true", help="Re-parse every file after the pull.")
 
+    audit_p = sub.add_parser(
+        "index-audit",
+        help="Scan the built SQLite index for unmasked secrets.",
+    )
+    audit_p.add_argument(
+        "index_file",
+        nargs="?",
+        type=Path,
+        default=None,
+        help="Index database (else --index or INDEX_PATH).",
+    )
+
     serve_p = sub.add_parser("serve", help="Run the Streamable HTTP MCP server on loopback.")
     serve_p.add_argument("--host", default=None, help="Bind address (default LISTEN_HOST or 127.0.0.1).")
     serve_p.add_argument("--port", type=int, default=None, help="Bind port (default LISTEN_PORT or 8787).")
@@ -89,6 +102,17 @@ def _print_stats(stats) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.command == "index-audit":
+        from vault_search.config import load_dotenv
+        from vault_search.index_audit import run_audit
+
+        load_dotenv()
+        index_path = args.index_file or args.index
+        if index_path is None:
+            raw = os.environ.get("INDEX_PATH")
+            index_path = Path(raw) if raw else Path.cwd() / "index" / "vault.db"
+        return run_audit(index_path)
+
     try:
         client = Client.from_env(
             vault_root=args.vault,
