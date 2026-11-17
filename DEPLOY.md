@@ -116,12 +116,15 @@ sudo -u vault-search git clone https://github.com/JoshTeperman/vault-search.git 
 sudo -u vault-search git -C /var/lib/vault-search/app rev-parse HEAD   # record this SHA in your report
 ```
 
-Create a virtualenv under the app directory (it is gitignored) and install the package when a later milestone needs it:
+Create a virtualenv under the app directory (it is gitignored) and install the package (code for the indexer, hybrid search, and MCP server is in this repo as of milestones 4–6). Use the same Python 3.11+ the box already has (`python3 --version`).
 
 ```bash
 sudo -u vault-search python3 -m venv /var/lib/vault-search/app/.venv
-sudo -u vault-search /var/lib/vault-search/app/.venv/bin/pip install -e /var/lib/vault-search/app
+sudo -u vault-search /var/lib/vault-search/app/.venv/bin/pip install -U pip
+sudo -u vault-search /var/lib/vault-search/app/.venv/bin/pip install -e "/var/lib/vault-search/app[semantic]"
 ```
+
+`[semantic]` pulls `fastembed` (ONNX, CPU) for `BAAI/bge-small-en-v1.5`. Without it the server still starts and search falls back to full-text. The first index with embeddings downloads the model into `EMBEDDING_CACHE_DIR` (or the library default under the service user's home). A local smoke on a 69-page / 331-chunk vault peaked at about 1.3 GB RSS while embedding, with a ~65 MB model cache, a ~2–3 MB SQLite index, and a ~300 MB venv. Plan for **2 GB RAM at a minimum** and **4 GB comfortably** once nginx, tailscaled, and the OS are counted. A 1 GB box is not enough. Disk needs of the app itself are modest (under 500 MB). The official `mcp` SDK is a core install dependency; Python 3.11 or later is required (3.13 is what CI uses).
 
 ### Completion criteria
 
@@ -229,17 +232,21 @@ Suggested production values (adjust paths if you used a different layout):
 | --- | --- |
 | `VAULT_ROOT` | `/var/lib/vault-search/vault` (after milestone 3) |
 | `INDEX_PATH` | `/var/lib/vault-search/index/vault.db` (after milestone 4) |
-| `EMBEDDING_MODEL_PATH` | `/var/lib/vault-search/models/<model>` (after milestone 5) |
-| `AUDIT_LOG_PATH` | `/var/log/vault-search/audit.log` |
+| `EMBEDDING_MODEL` | `BAAI/bge-small-en-v1.5` |
+| `EMBEDDING_CACHE_DIR` | `/var/lib/vault-search/models` (gitignored; created on first embed) |
+| `EMBEDDING_MODEL_PATH` | leave empty to let fastembed use the cache dir, or point at a pre-fetched model directory |
+| `AUDIT_LOG_PATH` | `/var/log/vault-search/audit.jsonl` |
+| `DENYLIST` | optional comma-separated device names, tags, or logins |
 | `DENYLIST_PATH` | `/etc/vault-search/denylist` (create an empty file if unused) |
 | `LISTEN_HOST` | `127.0.0.1` (required) |
 | `LISTEN_PORT` | `8787` (or another free loopback port) |
 | `MCP_PATH` | `/vault/mcp` |
+| `LISTEN_ALLOW_NONLOCAL` | leave unset (the process refuses `0.0.0.0` / `::` without it) |
 | `PUBLIC_BASE_URL` | `https://<vps>.<tailnet>.ts.net` — use the real MagicDNS name **only** in this on-box file |
 | `IDENTITY_SOURCE` | `whois` (required under nginx; see [Caller identity](#8-caller-identity-audit-log-and-denylist)) |
 | `TAILSCALED_SOCKET` | `/var/run/tailscale/tailscaled.sock` (use `/run/tailscale/tailscaled.sock` if that is what the box has) |
 
-`LISTEN_HOST` must stay loopback. Do not set it to `0.0.0.0`, to a public IP, or to the tailnet IP; nginx is what listens on the tailnet.
+`LISTEN_HOST` must stay loopback. Do not set it to `0.0.0.0`, to a public IP, or to the tailnet IP; nginx is what listens on the tailnet. The process refuses a wildcard bind unless `LISTEN_ALLOW_NONLOCAL=1`.
 
 ### Completion criteria
 
@@ -259,7 +266,7 @@ Expected:
 
 ## 6. systemd unit (loopback only)
 
-**Available from milestone 6** (the MCP server is not in this repo yet). You may install the unit file earlier, but do not enable it until `python -m vault_search.mcp` exists and `LISTEN_HOST` is `127.0.0.1`.
+The MCP server lives in this repo (`python -m vault_search.mcp`). You may install the unit file at any time, but do not enable it until `LISTEN_HOST` is `127.0.0.1`, the vault checkout exists, and the index has been built at least once (`python -m vault_search index`). Enabling the unit on the VPS is still blocked on VPS access.
 
 Write `/etc/systemd/system/vault-search.service`:
 
@@ -298,7 +305,55 @@ sudo systemctl enable --now vault-search
 sudo systemctl status vault-search
 ```
 
-The index rebuild after a vault pull is **available from milestone 4**; hybrid embeddings are **available from milestone 5**. Those can be a second systemd service or timer later. Do not start them before the code exists.
+### Sync timer (`git pull --ff-only` plus reindex)
+
+Write `/etc/systemd/system/vault-search-sync.service` (a oneshot, not a long-running daemon):
+
+```ini
+[Unit]
+Description=vault-search pull-only vault sync and reindex
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=vault-search
+Group=vault-search
+EnvironmentFile=/etc/vault-search/env
+WorkingDirectory=/var/lib/vault-search/app
+ExecStart=/var/lib/vault-search/app/.venv/bin/python -m vault_search sync
+Nice=10
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/vault-search /var/log/vault-search
+```
+
+And `/etc/systemd/system/vault-search-sync.timer`:
+
+```ini
+[Unit]
+Description=Periodic vault-search sync
+
+[Timer]
+OnBootSec=2m
+OnUnitActiveSec=10m
+AccuracySec=1m
+Persistent=true
+Unit=vault-search-sync.service
+
+[Install]
+WantedBy=timers.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now vault-search-sync.timer
+systemctl list-timers vault-search-sync.timer
+```
+
+`python -m vault_search sync` runs `git pull --ff-only` in `VAULT_ROOT` and then reindexes (embeddings are written only for new or changed chunks when the semantic extra is installed). It refuses to run if `VAULT_ROOT` is not itself a git checkout. A failed non-fast-forward pull fails the unit and does not rewrite the index.
 
 ### Completion criteria
 

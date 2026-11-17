@@ -46,3 +46,8 @@ htmlcov/
 .DS_Store
 Thumbs.db
 *.swp
+
+# Audit logs (never commit)
+audit/
+*.audit.jsonl
+audit.jsonl

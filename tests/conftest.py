@@ -18,7 +18,7 @@ def vault_root() -> Path:
 @pytest.fixture
 def client(vault_root: Path, tmp_path: Path) -> Client:
     settings = Settings(vault_root=vault_root, index_path=tmp_path / "index.db")
-    instance = Client(settings)
+    instance = Client(settings, autoload=False)
     instance.reindex()
     try:
         yield instance

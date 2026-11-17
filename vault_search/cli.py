@@ -38,13 +38,13 @@ def build_parser() -> argparse.ArgumentParser:
     index_p = sub.add_parser("index", help="Build or incrementally update the FTS5 index.")
     index_p.add_argument("--force", action="store_true", help="Re-parse every file, even if unchanged.")
 
-    search_p = sub.add_parser("search", help="Full-text search (compact markdown).")
+    search_p = sub.add_parser("search", help="Search the vault (hybrid by default).")
     search_p.add_argument("query")
     search_p.add_argument(
         "--mode",
-        default="fulltext",
+        default="hybrid",
         choices=("fulltext", "hybrid", "semantic"),
-        help="hybrid and semantic are reserved for milestone 5; they currently use fulltext.",
+        help="Default hybrid uses RRF when embeddings exist, else full-text.",
     )
     _add_filter_flags(search_p, with_after=True, default_limit=8)
 
@@ -56,7 +56,34 @@ def build_parser() -> argparse.ArgumentParser:
     _add_filter_flags(list_p, with_after=True, default_limit=20)
 
     sub.add_parser("list-projects", help="List projects (manifests and project tags).")
+
+    sync_p = sub.add_parser(
+        "sync",
+        help="git pull --ff-only at the vault root, then reindex.",
+    )
+    sync_p.add_argument("--force", action="store_true", help="Re-parse every file after the pull.")
+
+    serve_p = sub.add_parser("serve", help="Run the Streamable HTTP MCP server on loopback.")
+    serve_p.add_argument("--host", default=None, help="Bind address (default LISTEN_HOST or 127.0.0.1).")
+    serve_p.add_argument("--port", type=int, default=None, help="Bind port (default LISTEN_PORT or 8787).")
+    serve_p.add_argument("--path", default=None, help="MCP URL path (default MCP_PATH or /vault/mcp).")
     return parser
+
+
+def _print_stats(stats) -> int:
+    sha = stats.vault_sha or "(no git sha)"
+    skip = " (unchanged, skipped)" if stats.skipped else ""
+    embedded = (
+        f", {stats.embeddings_written} embeddings"
+        if getattr(stats, "embeddings_written", 0)
+        else ""
+    )
+    print(
+        f"indexed {stats.pages} pages, {stats.chunks} chunks "
+        f"({stats.upserted} updated, {stats.unchanged} unchanged, "
+        f"{stats.deleted} deleted{embedded}) in {stats.elapsed_ms} ms; sha {sha}{skip}"
+    )
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -74,14 +101,25 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if args.command == "index":
-            stats = client.reindex(force=args.force)
-            sha = stats.vault_sha or "(no git sha)"
-            skip = " (unchanged, skipped)" if stats.skipped else ""
-            print(
-                f"indexed {stats.pages} pages, {stats.chunks} chunks "
-                f"({stats.upserted} updated, {stats.unchanged} unchanged, "
-                f"{stats.deleted} deleted) in {stats.elapsed_ms} ms; sha {sha}{skip}"
-            )
+            return _print_stats(client.reindex(force=args.force))
+        if args.command == "sync":
+            from vault_search.sync import pull_ff_only
+
+            message = pull_ff_only(client.settings.vault_root)
+            print(message)
+            return _print_stats(client.reindex(force=args.force))
+        if args.command == "serve":
+            from vault_search.config import normalize_mcp_path
+            from vault_search.mcp import serve
+
+            settings = client.settings
+            if args.host:
+                object.__setattr__(settings, "listen_host", args.host)
+            if args.port is not None:
+                object.__setattr__(settings, "listen_port", args.port)
+            if args.path:
+                object.__setattr__(settings, "mcp_path", normalize_mcp_path(args.path))
+            serve(settings, client=client)
             return 0
         if args.command == "search":
             text = client.search(

@@ -2,7 +2,7 @@
 
 Read-only search interface for a private knowledge vault, with a bundled MCP server. It is intended for coding agents: find a page or section, read only what is needed, and keep context small.
 
-This repository holds the search interface, the shared secret detector, and a local FTS5 indexer. The vault itself is a separate private checkout and is **never** committed here. Milestone 4 (full-text index and CLI) is implemented; hybrid embeddings and the MCP server come later.
+This repository holds the search interface, the shared secret detector, a local FTS5 indexer with optional hybrid search, and a Streamable HTTP MCP server. The vault itself is a separate private checkout and is **never** committed here. Milestones 4–6 are implemented in this tree; running the server on the VPS is still a later deploy step (see [DEPLOY.md](DEPLOY.md)).
 
 ## Non-goals
 
@@ -16,7 +16,7 @@ This repository holds the search interface, the shared secret detector, and a lo
 
 All tools are read-only. Every response is run through the secret masker. Results are compact markdown (path, title, heading breadcrumb, projects/tags, snippet) rather than raw JSON. There are no ids, raw scores, or UUIDs.
 
-The Python API (`Client`) is what the MCP layer will wrap. Search is **full-text** in this milestone (`mode=fulltext`). `hybrid` and `semantic` are accepted and currently fall back to full-text; vectors attach to chunks in milestone 5.
+The Python API (`Client`) is what the MCP server wraps. Search defaults to **hybrid** (full-text plus local semantic search, fused with RRF, k=60) when embeddings exist. Install the optional extra (`pip install '.[semantic]'`) to enable them; without it, or before the first embed, hybrid and semantic fall back to full-text. `mode=fulltext` and `mode=semantic` remain explicit overrides. Filters apply to every mode.
 
 | Tool | Arguments | Result |
 | --- | --- | --- |
@@ -40,10 +40,15 @@ Runtime configuration comes from the environment (or a gitignored `.env`). This 
 | `VAULT_ROOT` | Path to the local vault checkout. That checkout is not part of this repo. `VAULT_PATH` is accepted as an alias if `VAULT_ROOT` is unset. |
 | `INDEX_PATH` | Path to the local SQLite FTS5 index. Defaults to `index/vault.db` under the current directory if unset (gitignored). |
 | `INDEX_INCLUDE_RAW` | Set to `1` to also index `raw/`. Off by default. |
-| `EMBEDDING_MODEL_PATH` | Path to the local embedding model files. Vault text is not sent to a hosted embedding API. |
+| `EMBEDDING_MODEL` | Embedding model name. Default `BAAI/bge-small-en-v1.5`. |
+| `EMBEDDING_CACHE_DIR` | Directory for downloaded ONNX model files (gitignored). |
+| `EMBEDDING_MODEL_PATH` | Optional path to a pre-fetched model directory. Vault text is not sent to a hosted embedding API. |
+| `INDEX_INCLUDE_EXAMPLES` | Set to `1` to index `wiki/_examples` and pages marked `example: true`. Off by default. |
+| `DENYLIST` | Comma-separated device names, tags, or logins to reject. |
 | `AUDIT_LOG_PATH` | Path to the append-only audit log. |
 | `DENYLIST_PATH` | Optional path to a caller denylist (defence in depth, on top of overlay-network access rules). |
-| `LISTEN_HOST` | Bind address. Must be `127.0.0.1` in production; the reverse proxy listens on the tailnet. Do not bind to `0.0.0.0` or a public IP. |
+| `LISTEN_HOST` | Bind address. Must be `127.0.0.1` in production; the reverse proxy listens on the tailnet. Binding `0.0.0.0` or `::` is refused unless `LISTEN_ALLOW_NONLOCAL=1`. |
+| `LISTEN_ALLOW_NONLOCAL` | Set to `1` only if you really mean to bind a non-loopback address. Leave unset in production. |
 | `LISTEN_PORT` | Bind port on loopback. |
 | `MCP_PATH` | URL path the proxy mounts, default `/vault/mcp`. The public endpoint is `https://<vps>.<tailnet>.ts.net/vault/mcp` (placeholders only). |
 | `PUBLIC_BASE_URL` | Tailnet-only base URL, for example `https://<vps>.<tailnet>.ts.net`. Use the real MagicDNS name only in the on-box env file. |
@@ -89,7 +94,7 @@ This same shared box is Vault Keeper's **verification node** for the [DEPLOY.md]
 
 ## Deploy
 
-Vault Keeper owns the code in this repository. Deployment on the VPS is done by pulling a release and following [DEPLOY.md](DEPLOY.md): service user, pull-only vault clone, loopback systemd unit, and an nginx `location /vault/mcp` in the on-box nginx git. The HTTP server itself is available from later milestones; the runbook marks those steps and gives checkable completion criteria for each one.
+Vault Keeper owns the code in this repository. Deployment on the VPS is done by pulling a release and following [DEPLOY.md](DEPLOY.md): service user, pull-only vault clone, loopback systemd unit, and an nginx `location /vault/mcp` in the on-box nginx git. The MCP server in this repo binds to loopback and is meant to sit behind the VPS nginx location. The runbook has checkable completion criteria for the VPS steps, which are still blocked on access.
 
 Vault Keeper independently verifies a deploy from the shared Grok Bot box (the verification node; see [Caller identity](#caller-identity-and-exposure)). A report from the VPS agent is not acceptance. For the externally visible checks (MCP `initialize` / `tools/list`, masked fixture query, public IP must fail):
 
@@ -122,9 +127,12 @@ with Client.from_env() as vault:
 ```bash
 python -m vault_search index
 python -m vault_search search "evals" --project alpha --limit 8
+python -m vault_search search "evals" --mode fulltext
 python -m vault_search read wiki/concepts/evals.md --section Scoring
 python -m vault_search list-notes --type concept
 python -m vault_search list-projects
+python -m vault_search sync          # git pull --ff-only at VAULT_ROOT, then reindex
+python -m vault_search.mcp           # Streamable HTTP on 127.0.0.1 (or `vault_search serve`)
 python -m vault_search.secrets scan .
 ```
 
@@ -133,17 +141,18 @@ python -m vault_search.secrets scan .
 1. **Public repo and secret scanner** — done. Detector, tests, CI, pre-commit, deploy runbook.
 2. **Access and inventory** — blocked on VPS access.
 3. **Pull-only vault sync on the VPS** — blocked on VPS access.
-4. **Index and CLI** — done in this tree. SQLite FTS5 over `wiki/`, heading chunks, backlinks, compact masked markdown, incremental reindex. No embeddings yet.
-5. **Hybrid search** — local embeddings attached to the existing chunk rows, RRF default.
-6. **MCP on the tailnet** — Streamable HTTP wrapping this same `Client` API; see [DEPLOY.md](DEPLOY.md).
+4. **Index and CLI** — done in this tree. SQLite FTS5 over `wiki/`, heading chunks, backlinks, compact masked markdown, incremental reindex.
+5. **Hybrid search** — done in this tree. Optional `fastembed` extra (`BAAI/bge-small-en-v1.5`, ONNX, CPU), vectors in `chunk_embeddings`, incremental embed, hybrid default with RRF k=60.
+6. **MCP server** — done in this tree (loopback Streamable HTTP, WhoIs identity, denylist, audit log, `scripts/verify-deploy`). Binding it to the VPS tailnet is still blocked on VPS access; see [DEPLOY.md](DEPLOY.md).
 7. **Adapter-ready** — tool contract documented for a future gateway; no other data sources.
 
 ## Development
 
-Requires Python 3.11 or later, stdlib only at runtime (pytest for development).
+Requires Python 3.11 or later. The core indexer is stdlib plus no hard runtime deps; the MCP server needs the official `mcp` SDK (pulled in by the `dev` extra), and local embeddings need `pip install '.[semantic]'` (fastembed/ONNX, not torch).
 
 ```bash
 python -m pip install -e ".[dev]"
+python -m pip install -e ".[semantic]"   # optional, for hybrid/semantic search
 python -m pytest -q
 python -m vault_search.secrets scan .
 ```
