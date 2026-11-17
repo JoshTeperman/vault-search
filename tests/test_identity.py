@@ -106,17 +106,51 @@ def test_audit_masks_args_and_counts_redactions(tmp_path: Path) -> None:
     args = summarize_args({"query": f"see {token}", "limit": 8})
     assert token not in json.dumps(args)
     assert "REDACTED" in args["query"]
+    hit = "- **Secret note** — `wiki/concepts/secret-note.md`\n  hello [REDACTED:github_pat]"
     event = append_event(
         log,
         caller=caller,
         tool="search",
         args={"query": f"see {token}", "limit": 8},
-        result_text="hello [REDACTED:github_pat]",
+        result_text=hit,
     )
     assert event["device"] == "fixture-device"
     assert event["agent_name_unverified"] == "unit-test"
     assert event["masked_hits"] == 1
-    assert masked_hit_count("hello [REDACTED:github_pat]") == 1
+    assert event["result_count"] == 1
+    assert event["zero_hits"] is False
+    assert masked_hit_count(hit) == 1
     recorded = log.read_text(encoding="utf-8")
     assert token not in recorded
     assert "unit-test" in recorded
+
+
+def test_audit_marks_zero_hit_searches(tmp_path: Path) -> None:
+    log = tmp_path / "audit.jsonl"
+    caller = resolve_caller(
+        headers={"X-Vault-Agent-Name": "unit-test"},
+        peer="127.0.0.1",
+        whois=lambda _addr: parse_whois(SAMPLE_NODE),
+    )
+    event = append_event(
+        log,
+        caller=caller,
+        tool="search",
+        args={"query": "no such term"},
+        result_text="No results.",
+    )
+    assert event["result_count"] == 0
+    assert event["zero_hits"] is True
+    recorded = log.read_text(encoding="utf-8")
+    assert '"zero_hits": true' in recorded
+    assert "no such term" in recorded
+    denied = append_event(
+        log,
+        caller=caller,
+        tool="search",
+        args={"query": "no such term"},
+        result_text="not authorized",
+        denied=True,
+    )
+    assert denied["result_count"] == 0
+    assert denied["zero_hits"] is False

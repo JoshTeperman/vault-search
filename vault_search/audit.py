@@ -63,6 +63,7 @@ def append_event(
     result_text: str,
     denied: bool = False,
 ) -> dict[str, Any]:
+    count = 0 if denied else result_count(tool, result_text)
     event = {
         "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "device": caller.device,
@@ -71,8 +72,9 @@ def append_event(
         "agent_name_unverified": caller.agent_name_unverified,
         "tool": tool,
         "args": summarize_args(args),
-        "result_count": 0 if denied else result_count(tool, result_text),
+        "result_count": count,
         "masked_hits": 0 if denied else masked_hit_count(result_text),
+        "zero_hits": (not denied and tool == "search" and count == 0),
         "denied": denied,
         "deny_reason": caller.deny_reason if denied else None,
     }

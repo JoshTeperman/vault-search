@@ -38,13 +38,13 @@ def build_parser() -> argparse.ArgumentParser:
     index_p = sub.add_parser("index", help="Build or incrementally update the FTS5 index.")
     index_p.add_argument("--force", action="store_true", help="Re-parse every file, even if unchanged.")
 
-    search_p = sub.add_parser("search", help="Search the vault (hybrid by default).")
+    search_p = sub.add_parser("search", help="Search the vault (full-text unless embeddings are installed).")
     search_p.add_argument("query")
     search_p.add_argument(
         "--mode",
         default="hybrid",
         choices=("fulltext", "hybrid", "semantic"),
-        help="Default hybrid uses RRF when embeddings exist, else full-text.",
+        help="hybrid falls back to full-text when embeddings are not installed.",
     )
     _add_filter_flags(search_p, with_after=True, default_limit=8)
 

@@ -2,7 +2,7 @@
 
 Read-only search interface for a private knowledge vault, with a bundled MCP server. It is intended for coding agents: find a page or section, read only what is needed, and keep context small.
 
-This repository holds the search interface, the shared secret detector, a local FTS5 indexer with optional hybrid search, and a Streamable HTTP MCP server. The vault itself is a separate private checkout and is **never** committed here. Milestones 4–6 are implemented in this tree; running the server on the VPS is still a later deploy step (see [DEPLOY.md](DEPLOY.md)).
+This repository holds the search interface, the shared secret detector, a local FTS5 indexer with optional hybrid search, and a Streamable HTTP MCP server. The vault itself is a separate private checkout and is **never** committed here. Milestones 4–6 are implemented in this tree. The v1 deploy is **keyword-only** (full-text) search: install without the `[semantic]` extra. Meaning-based search can be turned on later by installing `.[semantic]` and reindexing; see [DEPLOY.md](DEPLOY.md).
 
 ## Non-goals
 
@@ -16,18 +16,18 @@ This repository holds the search interface, the shared secret detector, a local 
 
 All tools are read-only. Every response is run through the secret masker. Results are compact markdown (path, title, heading breadcrumb, projects/tags, snippet) rather than raw JSON. There are no ids, raw scores, or UUIDs.
 
-The Python API (`Client`) is what the MCP server wraps. Search defaults to **hybrid** (full-text plus local semantic search, fused with RRF, k=60) when embeddings exist. Install the optional extra (`pip install '.[semantic]'`) to enable them; without it, or before the first embed, hybrid and semantic fall back to full-text. `mode=fulltext` and `mode=semantic` remain explicit overrides. Filters apply to every mode.
+The Python API (`Client`) is what the MCP server wraps. The v1 deploy does not install embeddings, so search is keyword (full-text) only. The API default `mode=hybrid` fuses full-text with local semantic search (RRF, k=60) **when embeddings exist**; if the `[semantic]` extra is not installed, or the index has no vectors, `hybrid` and `semantic` fall back to full-text. `mode=fulltext` and `mode=semantic` remain explicit overrides. Filters apply to every mode. Do not treat a hybrid fallback as a semantic result.
 
 | Tool | Arguments | Result |
 | --- | --- | --- |
-| `search` | `query: string`, `mode: "hybrid" \| "fulltext" \| "semantic" = "hybrid"`, `project?: string`, `tags?: string[]`, `type?: string`, `limit: int = 8` | Markdown hit list. Default `limit` is 8, hard cap 20. |
+| `search` | `query: string`, `mode: "hybrid" \| "fulltext" \| "semantic" = "hybrid"`, `project?: string`, `tags?: string[]`, `type?: string`, `limit: int = 8` | Markdown hit list. Default `limit` is 8, hard cap 20. `hybrid` falls back to full-text when embeddings are not installed. |
 | `read_note` | `path: string`, `section?: string` | Markdown header, links, backlinks, and the named section, the body, or a heading outline if the body is long. `not_found` only when the path is genuinely missing. |
 | `list_notes` | `project?: string`, `tags?: string[]`, `type?: string`, `limit: int = 20`, `after?: string` | Markdown list. `after` is the last path, not an opaque cursor. |
 | `list_projects` | _(none)_ | Markdown list of every project (name and one-line description). |
 
 `path` is a vault-relative wiki path such as `wiki/concepts/example.md`.
 
-Default `search` is hybrid (full-text plus local semantic search, fused). `mode` is for debugging. Optional `project` / `tags` / `type` filters narrow results; they do not hide pages from an unfiltered call.
+On a v1 (keyword-only) install, `search` returns full-text hits even if the caller passes `mode=hybrid`. `mode` is otherwise for debugging once semantic search is enabled. Optional `project` / `tags` / `type` filters narrow results; they do not hide pages from an unfiltered call.
 
 `read_note` of a long page (over about 8,000 characters) without `section` returns a heading outline instead of the body.
 
@@ -40,9 +40,9 @@ Runtime configuration comes from the environment (or a gitignored `.env`). This 
 | `VAULT_ROOT` | Path to the local vault checkout. That checkout is not part of this repo. `VAULT_PATH` is accepted as an alias if `VAULT_ROOT` is unset. |
 | `INDEX_PATH` | Path to the local SQLite FTS5 index. Defaults to `index/vault.db` under the current directory if unset (gitignored). |
 | `INDEX_INCLUDE_RAW` | Set to `1` to also index `raw/`. Off by default. |
-| `EMBEDDING_MODEL` | Embedding model name. Default `BAAI/bge-small-en-v1.5`. |
-| `EMBEDDING_CACHE_DIR` | Directory for downloaded ONNX model files (gitignored). |
-| `EMBEDDING_MODEL_PATH` | Optional path to a pre-fetched model directory. Vault text is not sent to a hosted embedding API. |
+| `EMBEDDING_MODEL` | Unused in the v1 keyword-only deploy. Default `BAAI/bge-small-en-v1.5` when semantic search is enabled later. |
+| `EMBEDDING_CACHE_DIR` | Unused in v1. Directory for downloaded ONNX model files (gitignored) once semantic search is enabled. |
+| `EMBEDDING_MODEL_PATH` | Unused in v1. Optional path to a pre-fetched model directory. Vault text is not sent to a hosted embedding API. |
 | `INDEX_INCLUDE_EXAMPLES` | Set to `1` to index `wiki/_examples` and pages marked `example: true`. Off by default. |
 | `DENYLIST` | Comma-separated device names, tags, or logins to reject. |
 | `AUDIT_LOG_PATH` | Path to the append-only audit log. |
@@ -80,7 +80,7 @@ The command exits `1` when it reports a finding, `0` when the paths are clean, a
 
 Rules cover common token formats (GitHub, OpenAI, Anthropic, AWS, Slack, Google), JWTs, private-key blocks, and high-entropy `key=` / `token=` (and similar) assignments.
 
-**Audit log.** Every tool call is appended to the log at `AUDIT_LOG_PATH`: timestamp, caller identity, tool, arguments, outcome, duration, and whether a secret-like span was masked (rule, path, span — not the secret value). Do not log secret values or vault body text. The log stays on the host; it is not committed here.
+**Audit log.** Every tool call is appended to the log at `AUDIT_LOG_PATH`: timestamp, caller identity, tool, arguments, `result_count`, and whether a secret-like span was masked (rule, path, span — not the secret value). Search calls that return no hits are logged with `result_count` 0 and `zero_hits` true. Vault Keeper uses those result counts to decide whether to enable semantic search later. Do not log secret values or vault body text. The log stays on the host; it is not committed here.
 
 **Caller identity and exposure.** The service is reachable only on a private tailnet, not the public internet. nginx on the VPS listens on the node's MagicDNS name only and serves this app at `https://<vps>.<tailnet>.ts.net/vault/mcp` (placeholders; never commit real names). TLS certificates come from `tailscale cert`. The nginx config lives in a separate git on the VPS, not in this repo. The systemd unit binds to `127.0.0.1` only. Agents connect over HTTPS, not SSH tunnels. Admin access is Tailscale SSH, governed by ACLs, not SSH keys. Funnel stays off.
 
@@ -142,17 +142,17 @@ python -m vault_search.secrets scan .
 2. **Access and inventory** — blocked on VPS access.
 3. **Pull-only vault sync on the VPS** — blocked on VPS access.
 4. **Index and CLI** — done in this tree. SQLite FTS5 over `wiki/`, heading chunks, backlinks, compact masked markdown, incremental reindex.
-5. **Hybrid search** — done in this tree. Optional `fastembed` extra (`BAAI/bge-small-en-v1.5`, ONNX, CPU), vectors in `chunk_embeddings`, incremental embed, hybrid default with RRF k=60.
+5. **Hybrid search** — done in this tree, optional. The v1 deploy is keyword-only (no `[semantic]` extra). Installing `fastembed` (`BAAI/bge-small-en-v1.5`, ONNX, CPU) and reindexing attaches vectors to `chunk_embeddings` and turns on RRF hybrid (k=60).
 6. **MCP server** — done in this tree (loopback Streamable HTTP, WhoIs identity, denylist, audit log, `scripts/verify-deploy`). Binding it to the VPS tailnet is still blocked on VPS access; see [DEPLOY.md](DEPLOY.md).
 7. **Adapter-ready** — tool contract documented for a future gateway; no other data sources.
 
 ## Development
 
-Requires Python 3.11 or later. The core indexer is stdlib plus no hard runtime deps; the MCP server needs the official `mcp` SDK (pulled in by the `dev` extra), and local embeddings need `pip install '.[semantic]'` (fastembed/ONNX, not torch).
+Requires Python 3.11 or later. The core indexer is stdlib plus the official `mcp` SDK (also listed in the `dev` extra). Local embeddings are optional: `pip install '.[semantic]'` (fastembed/ONNX, not torch). The v1 deploy does not install that extra.
 
 ```bash
 python -m pip install -e ".[dev]"
-python -m pip install -e ".[semantic]"   # optional, for hybrid/semantic search
+python -m pip install -e ".[semantic]"   # optional; not part of the v1 deploy
 python -m pytest -q
 python -m vault_search.secrets scan .
 ```

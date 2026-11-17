@@ -40,7 +40,8 @@ Follow these for every step. If a step would violate one, stop and ask Josh.
 
 Do these first, every time you land on the box. RAM and Python are the first checks: stop and report if either fails.
 
-- **RAM:** `free -m` shows at least 2048 MB total memory (4096 MB is comfortable). Indexing with embeddings peaked at about 1.3 GB RSS. If the box has less than 2 GB, stop and report to Josh; do not add swap or resize the server yourself.
+- **RAM (v1 is keyword-only):** `free -m` should show at least **512 MB available** (`MemAvailable`). A full-vault fulltext-only index built in 0.16 s and peaked at 23 MB RSS. There is no 2 GB minimum for this default. If available memory is below 512 MB, stop and report to Josh; do not add swap or resize the server yourself.
+- The **2 GB minimum (4 GB comfortable)** applies only when semantic search is enabled later. Indexing with embeddings peaked at about 1.3 GB RSS. Do not install `.[semantic]` until that RAM is in place; see [Enabling semantic search later](#enabling-semantic-search-later).
 - You reached the VPS with **Tailscale SSH** (not a public SSH port you opened, and not an SSH tunnel for agents).
 - `python3 --version` is 3.11 or later; `git`, `systemctl`, `curl`, `nginx`, and `tailscale` are on `PATH`.
 - `tailscale status` shows this node is online, with MagicDNS and tailnet HTTPS available. Do not paste the node or tailnet name into git.
@@ -59,7 +60,7 @@ Do these first, every time you land on the box. RAM and Python are the first che
 ### Completion criteria
 
 ```bash
-awk '/MemTotal/ {exit !($2 >= 2000000)}' /proc/meminfo && echo RAM_OK || echo RAM_TOO_SMALL
+awk '/MemAvailable/ {exit !($2 >= 512000)}' /proc/meminfo && echo RAM_OK || echo RAM_TOO_SMALL
 python3 -c 'import sys; assert sys.version_info >= (3, 11), sys.version'
 command -v git systemctl curl nginx tailscale
 tailscale status --json | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d.get("BackendState")=="Running", d.get("BackendState")'
@@ -68,7 +69,7 @@ tailscale funnel status
 
 Expected:
 
-- `RAM_OK` (at least 2 GB total memory). `RAM_TOO_SMALL` means stop and report.
+- `RAM_OK` (at least 512 MB available memory). `RAM_TOO_SMALL` means stop and report. A box with less than 2 GB total is fine for keyword-only v1; do not treat that as a failure.
 - Python is 3.11 or later; all five commands are on `PATH`.
 - Firewall rules (read-only check) allow 443 only on `tailscale0` or from `100.64.0.0/10`, never on the public interface. If not, report to Josh; do not change them.
 - Backend state is `Running`. Do not paste the node or tailnet name into git or into this repo.
@@ -121,15 +122,15 @@ sudo -u vault-search git clone https://github.com/JoshTeperman/vault-search.git 
 sudo -u vault-search git -C /var/lib/vault-search/app rev-parse HEAD   # record this SHA in your report
 ```
 
-Create a virtualenv under the app directory (it is gitignored) and install the package (code for the indexer, hybrid search, and MCP server is in this repo as of milestones 4–6). Use the same Python 3.11+ the box already has (`python3 --version`).
+Create a virtualenv under the app directory (it is gitignored) and install the package **without** the `[semantic]` extra. v1 is keyword-only (full-text) search. The hybrid/semantic code is in the tree but stays off until you install that extra and reindex; see [Enabling semantic search later](#enabling-semantic-search-later). Use the same Python 3.11+ the box already has (`python3 --version`).
 
 ```bash
 sudo -u vault-search python3 -m venv /var/lib/vault-search/app/.venv
 sudo -u vault-search /var/lib/vault-search/app/.venv/bin/pip install -U pip
-sudo -u vault-search /var/lib/vault-search/app/.venv/bin/pip install -e "/var/lib/vault-search/app[semantic]"
+sudo -u vault-search /var/lib/vault-search/app/.venv/bin/pip install -e /var/lib/vault-search/app
 ```
 
-`[semantic]` pulls `fastembed` (ONNX, CPU) for `BAAI/bge-small-en-v1.5`. Without it the server still starts and search falls back to full-text. The first index with embeddings downloads the model into `EMBEDDING_CACHE_DIR` (or the library default under the service user's home). A local smoke on a 69-page / 331-chunk vault peaked at about 1.3 GB RSS while embedding, with a ~65 MB model cache, a ~2–3 MB SQLite index, and a ~300 MB venv. Plan for **2 GB RAM at a minimum** and **4 GB comfortably** once nginx, tailscaled, and the OS are counted. A 1 GB box is not enough. Disk needs of the app itself are modest (under 500 MB). The official `mcp` SDK is a core install dependency; Python 3.11 or later is required (3.13 is what CI uses).
+Do not pass `[semantic]` for this deploy. The official `mcp` SDK is a core dependency. A full-vault keyword-only index built in 0.16 s and peaked at 23 MB RSS; the SQLite index is a few megabytes. Disk needs of the app itself are modest. No model is downloaded, and no model cache is expected.
 
 ### Completion criteria
 
@@ -139,6 +140,8 @@ sudo -u vault-search git -C /var/lib/vault-search/app status --porcelain
 sudo -u vault-search git -C /var/lib/vault-search/app rev-parse HEAD
 sudo -u vault-search git -C /var/lib/vault-search/app rev-parse origin/main
 test -x /var/lib/vault-search/app/.venv/bin/python
+/var/lib/vault-search/app/.venv/bin/python -c 'import importlib.util, sys; sys.exit(0 if importlib.util.find_spec("fastembed") is None else 1)' && echo KEYWORD_ONLY || echo SEMANTIC_INSTALLED
+if [ -d /var/lib/vault-search/models ]; then find /var/lib/vault-search/models -type f | wc -l; else echo 0; fi
 ```
 
 Expected:
@@ -147,6 +150,8 @@ Expected:
 - The working tree is clean (`status --porcelain` is empty).
 - `HEAD` equals `origin/main`. Record that SHA in the report.
 - After the venv step, `/var/lib/vault-search/app/.venv/bin/python` is executable.
+- The venv prints `KEYWORD_ONLY` (`fastembed` is not installed).
+- The model directory file count is `0`. No model cache is expected for v1.
 
 ## 4. Pull-only clone of the private vault
 
@@ -237,9 +242,9 @@ Suggested production values (adjust paths if you used a different layout):
 | --- | --- |
 | `VAULT_ROOT` | `/var/lib/vault-search/vault` (after milestone 3) |
 | `INDEX_PATH` | `/var/lib/vault-search/index/vault.db` (after milestone 4) |
-| `EMBEDDING_MODEL` | `BAAI/bge-small-en-v1.5` |
-| `EMBEDDING_CACHE_DIR` | `/var/lib/vault-search/models` (gitignored; created on first embed) |
-| `EMBEDDING_MODEL_PATH` | leave empty to let fastembed use the cache dir, or point at a pre-fetched model directory |
+| `EMBEDDING_MODEL` | leave unset for v1 (keyword-only). Default `BAAI/bge-small-en-v1.5` only when enabling semantic search later |
+| `EMBEDDING_CACHE_DIR` | leave unset for v1. Use `/var/lib/vault-search/models` only when enabling semantic search later |
+| `EMBEDDING_MODEL_PATH` | leave unset for v1 |
 | `AUDIT_LOG_PATH` | `/var/log/vault-search/audit.jsonl` |
 | `DENYLIST` | optional comma-separated device names, tags, or logins |
 | `DENYLIST_PATH` | `/etc/vault-search/denylist` (create an empty file if unused) |
@@ -251,6 +256,8 @@ Suggested production values (adjust paths if you used a different layout):
 | `IDENTITY_SOURCE` | `whois` (required under nginx; see [Caller identity](#8-caller-identity-audit-log-and-denylist)) |
 | `TAILSCALED_SOCKET` | `/var/run/tailscale/tailscaled.sock` (use `/run/tailscale/tailscaled.sock` if that is what the box has) |
 
+Leave the `EMBEDDING_*` variables unset for this deploy. Setting a cache directory does not enable semantic search; that requires `pip install '.[semantic]'` and a reindex, and must not be done until the RAM check in [Enabling semantic search later](#enabling-semantic-search-later) passes.
+
 `LISTEN_HOST` must stay loopback. Do not set it to `0.0.0.0`, to a public IP, or to the tailnet IP; nginx is what listens on the tailnet. The process refuses a wildcard bind unless `LISTEN_ALLOW_NONLOCAL=1`.
 
 ### Completion criteria
@@ -258,6 +265,8 @@ Suggested production values (adjust paths if you used a different layout):
 ```bash
 stat -c '%a %U:%G %n' /etc/vault-search/env
 sudo grep -E '^(LISTEN_HOST|LISTEN_PORT|MCP_PATH|IDENTITY_SOURCE)=' /etc/vault-search/env
+sudo grep -E '^(EMBEDDING_CACHE_DIR|EMBEDDING_MODEL_PATH)=' /etc/vault-search/env || true
+if [ -d /var/lib/vault-search/models ]; then find /var/lib/vault-search/models -type f | wc -l; else echo 0; fi
 ```
 
 Expected:
@@ -267,6 +276,7 @@ Expected:
 - `LISTEN_PORT` is a port (default `8787`)
 - `MCP_PATH=/vault/mcp`
 - `IDENTITY_SOURCE=whois`
+- `EMBEDDING_CACHE_DIR` and `EMBEDDING_MODEL_PATH` are unset (or empty). No model cache is expected for v1.
 - Do not paste other env values (paths, `PUBLIC_BASE_URL`) into git.
 
 ## 6. systemd unit (loopback only)
@@ -358,7 +368,7 @@ sudo systemctl enable --now vault-search-sync.timer
 systemctl list-timers vault-search-sync.timer
 ```
 
-`python -m vault_search sync` runs `git pull --ff-only` in `VAULT_ROOT` and then reindexes (embeddings are written only for new or changed chunks when the semantic extra is installed). It refuses to run if `VAULT_ROOT` is not itself a git checkout. A failed non-fast-forward pull fails the unit and does not rewrite the index.
+`python -m vault_search sync` runs `git pull --ff-only` in `VAULT_ROOT` and then reindexes. On the v1 keyword-only install this is a full-text rebuild only (no embeddings, no model cache). Embeddings are written only for new or changed chunks after the semantic extra is installed; see [Enabling semantic search later](#enabling-semantic-search-later). It refuses to run if `VAULT_ROOT` is not itself a git checkout. A failed non-fast-forward pull fails the unit and does not rewrite the index.
 
 ### Completion criteria
 
@@ -368,6 +378,8 @@ systemctl list-timers vault-search-sync.timer
 systemctl is-enabled vault-search
 systemctl is-active vault-search
 ss -tlnp | grep -E ':8787\b'
+/var/lib/vault-search/app/.venv/bin/python -c 'import importlib.util, sys; sys.exit(0 if importlib.util.find_spec("fastembed") is None else 1)' && echo KEYWORD_ONLY || echo SEMANTIC_INSTALLED
+if [ -d /var/lib/vault-search/models ]; then find /var/lib/vault-search/models -type f | wc -l; else echo 0; fi
 ```
 
 Expected:
@@ -375,6 +387,49 @@ Expected:
 - `is-enabled` prints `enabled`.
 - `is-active` prints `active`.
 - `ss` shows `127.0.0.1:8787` (or the configured `LISTEN_PORT`) and does **not** show `0.0.0.0:8787`, `*:8787`, or a public or tailnet address for this process.
+- The venv still prints `KEYWORD_ONLY`, and the model directory file count is `0`. No model cache is expected for v1.
+
+### Enabling semantic search later
+
+Leave this section until Vault Keeper asks for it, typically after reviewing audit-log `result_count` values (including `zero_hits` on search). The search code is already in the tree; enabling it is an install plus a reindex, not a code change.
+
+1. **RAM first.** `free -m` should show at least 2048 MB total memory (4096 MB is comfortable). Indexing with embeddings peaked at about 1.3 GB RSS. If the box has less than 2 GB, stop and report to Josh; do not add swap or resize the server yourself, and do not install the extra.
+2. Install the optional extra into the existing venv:
+
+   ```bash
+   sudo -u vault-search /var/lib/vault-search/app/.venv/bin/pip install -e "/var/lib/vault-search/app[semantic]"
+   ```
+
+3. In `/etc/vault-search/env` (on the box only), set `EMBEDDING_MODEL=BAAI/bge-small-en-v1.5` and `EMBEDDING_CACHE_DIR=/var/lib/vault-search/models`. Leave `EMBEDDING_MODEL_PATH` empty unless you are pointing at a pre-fetched model directory. Do not commit this file.
+4. Rebuild the index so vectors are written for current chunks:
+
+   ```bash
+   sudo -u vault-search /var/lib/vault-search/app/.venv/bin/python -m vault_search index
+   ```
+
+5. Restart the service: `sudo systemctl restart vault-search`.
+
+The first run downloads the ONNX model into `EMBEDDING_CACHE_DIR` (about 65 MB). RSS will rise toward the 1.3 GB peak observed while embedding. `mode=hybrid` then fuses full-text with semantic search; until this section is done, it continues to fall back to full-text.
+
+#### Completion criteria
+
+```bash
+awk '/MemTotal/ {exit !($2 >= 2000000)}' /proc/meminfo && echo RAM_OK || echo RAM_TOO_SMALL
+/var/lib/vault-search/app/.venv/bin/python -c 'import fastembed; print("SEMANTIC_OK")'
+sudo grep -E '^(EMBEDDING_MODEL|EMBEDDING_CACHE_DIR)=' /etc/vault-search/env
+if [ -d /var/lib/vault-search/models ]; then find /var/lib/vault-search/models -type f | wc -l; else echo 0; fi
+systemctl is-active vault-search
+ss -tlnp | grep -E ':8787\b'
+```
+
+Expected:
+
+- `RAM_OK` (at least 2 GB total memory). `RAM_TOO_SMALL` means stop and report; do not install the extra.
+- The venv prints `SEMANTIC_OK`.
+- `EMBEDDING_MODEL` and `EMBEDDING_CACHE_DIR` are set in the on-box env file. Do not paste those values into git.
+- The model directory file count is greater than `0`.
+- The index command reported embeddings written (a positive `embeddings` count in its summary). Do not paste vault content.
+- `is-active` is `active`, and `ss` still shows only `127.0.0.1:8787` (or the configured loopback port).
 
 ## 7. nginx in front of the app
 
@@ -469,7 +524,7 @@ The service user must be able to read that socket (see [Service user and directo
 
 If a request carries `Tailscale-Funnel-Request`, reject it. Funnel is supposed to be off; this is defence in depth.
 
-The audit log (`AUDIT_LOG_PATH`) is append-only on the box. Each line should include timestamp, caller (node, tags, user if any), tool, arguments, outcome, duration, and whether a secret-like span was masked (rule, path, span — not the secret). Do not log secret values, vault body text, or values you would not want copied off the box. Do not commit the log.
+The audit log (`AUDIT_LOG_PATH`) is append-only on the box. Each line should include timestamp, caller (node, tags, user if any), tool, arguments, `result_count`, and whether a secret-like span was masked (rule, path, span — not the secret). Search calls that return no hits are logged with `result_count` 0 and `zero_hits` true; Vault Keeper uses those counts to decide whether to enable semantic search. Do not log secret values, vault body text, or values you would not want copied off the box. Do not commit the log.
 
 ### Completion criteria
 
@@ -570,6 +625,8 @@ sudo -u vault-search git -C /var/lib/vault-search/app pull --ff-only origin main
 sudo -u vault-search /var/lib/vault-search/app/.venv/bin/pip install -e /var/lib/vault-search/app
 sudo systemctl restart vault-search    # only once the unit is enabled
 ```
+
+Keep the v1 install keyword-only: do not add `[semantic]` on a routine update. If semantic search was already enabled, reinstall with `pip install -e "/var/lib/vault-search/app[semantic]"` instead so the extra is not dropped, then reindex if the model or schema changed.
 
 Re-run [section 9](#9-end-to-end-verification). If the unit is not yet enabled (pre-milestone 6), skip the restart.
 
