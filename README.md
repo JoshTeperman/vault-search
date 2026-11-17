@@ -2,7 +2,7 @@
 
 Read-only search interface for a private knowledge vault, with a bundled MCP server. It is intended for coding agents: find a page or section, read only what is needed, and keep context small.
 
-This repository holds the interface and the shared secret detector. The vault itself is a separate private checkout and is **never** committed here. Milestone 1 is the scaffold and secret detector only; indexing, search, and the MCP server come later.
+This repository holds the search interface, the shared secret detector, and a local FTS5 indexer. The vault itself is a separate private checkout and is **never** committed here. Milestone 4 (full-text index and CLI) is implemented; hybrid embeddings and the MCP server come later.
 
 ## Non-goals
 
@@ -12,9 +12,11 @@ This repository holds the interface and the shared secret detector. The vault it
 - Building a wider context gateway. Tool names and result shapes are kept stable so a gateway can front this service later.
 - Shipping vault notes, hostnames, overlay-network details, addresses, or credentials in this repository.
 
-## Planned tool contract
+## Tool contract
 
-All tools are read-only. Every response is run through the secret masker. Results are compact markdown (path, title, heading breadcrumb, projects/tags, snippet) rather than raw JSON.
+All tools are read-only. Every response is run through the secret masker. Results are compact markdown (path, title, heading breadcrumb, projects/tags, snippet) rather than raw JSON. There are no ids, raw scores, or UUIDs.
+
+The Python API (`Client`) is what the MCP layer will wrap. Search is **full-text** in this milestone (`mode=fulltext`). `hybrid` and `semantic` are accepted and currently fall back to full-text; vectors attach to chunks in milestone 5.
 
 | Tool | Arguments | Result |
 | --- | --- | --- |
@@ -27,7 +29,7 @@ All tools are read-only. Every response is run through the secret masker. Result
 
 Default `search` is hybrid (full-text plus local semantic search, fused). `mode` is for debugging. Optional `project` / `tags` / `type` filters narrow results; they do not hide pages from an unfiltered call.
 
-These tools are not implemented in this milestone.
+`read_note` of a long page (over about 8,000 characters) without `section` returns a heading outline instead of the body.
 
 ## Configuration
 
@@ -35,8 +37,9 @@ Runtime configuration comes from the environment (or a gitignored `.env`). This 
 
 | Variable | Purpose |
 | --- | --- |
-| `VAULT_ROOT` | Path to the local vault checkout. That checkout is not part of this repo. |
-| `INDEX_PATH` | Path to the local search index database. |
+| `VAULT_ROOT` | Path to the local vault checkout. That checkout is not part of this repo. `VAULT_PATH` is accepted as an alias if `VAULT_ROOT` is unset. |
+| `INDEX_PATH` | Path to the local SQLite FTS5 index. Defaults to `index/vault.db` under the current directory if unset (gitignored). |
+| `INDEX_INCLUDE_RAW` | Set to `1` to also index `raw/`. Off by default. |
 | `EMBEDDING_MODEL_PATH` | Path to the local embedding model files. Vault text is not sent to a hosted embedding API. |
 | `AUDIT_LOG_PATH` | Path to the append-only audit log. |
 | `DENYLIST_PATH` | Optional path to a caller denylist (defence in depth, on top of overlay-network access rules). |
@@ -101,9 +104,43 @@ export MCP_PATH=/vault/mcp
 python3 scripts/verify-deploy
 ```
 
+## Local index and CLI
+
+Requires a vault checkout path and an index path (see configuration). `wiki/` is indexed first; `raw/` is off unless `INDEX_INCLUDE_RAW=1` or `--include-raw`. Reindex is incremental (git SHA plus per-file mtimes and SHA-256). Tests use only synthetic fixtures under `tests/fixtures`; never point the test suite at a real vault.
+
+```python
+from vault_search import Client
+
+with Client.from_env() as vault:
+    vault.reindex()
+    print(vault.search("evals", project="alpha"))
+    print(vault.read_note("wiki/concepts/evals.md", section="Scoring"))
+    print(vault.list_notes(type="concept", after="wiki/concepts/example.md"))
+    print(vault.list_projects())
+```
+
+```bash
+python -m vault_search index
+python -m vault_search search "evals" --project alpha --limit 8
+python -m vault_search read wiki/concepts/evals.md --section Scoring
+python -m vault_search list-notes --type concept
+python -m vault_search list-projects
+python -m vault_search.secrets scan .
+```
+
+## Milestones
+
+1. **Public repo and secret scanner** — done. Detector, tests, CI, pre-commit, deploy runbook.
+2. **Access and inventory** — blocked on VPS access.
+3. **Pull-only vault sync on the VPS** — blocked on VPS access.
+4. **Index and CLI** — done in this tree. SQLite FTS5 over `wiki/`, heading chunks, backlinks, compact masked markdown, incremental reindex. No embeddings yet.
+5. **Hybrid search** — local embeddings attached to the existing chunk rows, RRF default.
+6. **MCP on the tailnet** — Streamable HTTP wrapping this same `Client` API; see [DEPLOY.md](DEPLOY.md).
+7. **Adapter-ready** — tool contract documented for a future gateway; no other data sources.
+
 ## Development
 
-Requires Python 3.11 or later.
+Requires Python 3.11 or later, stdlib only at runtime (pytest for development).
 
 ```bash
 python -m pip install -e ".[dev]"
