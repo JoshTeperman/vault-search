@@ -38,8 +38,9 @@ Follow these for every step. If a step would violate one, stop and ask Josh.
 
 ## 1. Prerequisites and checks
 
-Do these first, every time you land on the box.
+Do these first, every time you land on the box. RAM and Python are the first checks: stop and report if either fails.
 
+- **RAM:** `free -m` shows at least 2048 MB total memory (4096 MB is comfortable). Indexing with embeddings peaked at about 1.3 GB RSS. If the box has less than 2 GB, stop and report to Josh; do not add swap or resize the server yourself.
 - You reached the VPS with **Tailscale SSH** (not a public SSH port you opened, and not an SSH tunnel for agents).
 - `python3 --version` is 3.11 or later; `git`, `systemctl`, `curl`, `nginx`, and `tailscale` are on `PATH`.
 - `tailscale status` shows this node is online, with MagicDNS and tailnet HTTPS available. Do not paste the node or tailnet name into git.
@@ -52,11 +53,13 @@ Do these first, every time you land on the box.
   If Funnel is on, **do not turn it off or on yourself** if that might be an ACL/policy change you were not asked to make — stop and ask Josh. The expected state is off.
 - Confirm the node has a tailnet IPv4 address (`tailscale ip -4`) and a public IPv4 address you can use later for the "not reachable on the public IP" check. Write those down only on the box, never in this repo.
 - This public repo is clonable over HTTPS (no token required): `https://github.com/JoshTeperman/vault-search.git`.
+- **Host firewall:** port 443 must be allowed only on the `tailscale0` interface (or only from `100.64.0.0/10`), never on the public interface (e.g. `eth0`). Josh makes firewall changes; check the current rules read-only (`sudo ufw status verbose` or `sudo nft list ruleset`) and report what you see.
 - nginx is already the reverse proxy on this VPS; its config is maintained in Claude's on-box git, not in `vault-search`.
 
 ### Completion criteria
 
 ```bash
+awk '/MemTotal/ {exit !($2 >= 2000000)}' /proc/meminfo && echo RAM_OK || echo RAM_TOO_SMALL
 python3 -c 'import sys; assert sys.version_info >= (3, 11), sys.version'
 command -v git systemctl curl nginx tailscale
 tailscale status --json | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d.get("BackendState")=="Running", d.get("BackendState")'
@@ -65,7 +68,9 @@ tailscale funnel status
 
 Expected:
 
+- `RAM_OK` (at least 2 GB total memory). `RAM_TOO_SMALL` means stop and report.
 - Python is 3.11 or later; all five commands are on `PATH`.
+- Firewall rules (read-only check) allow 443 only on `tailscale0` or from `100.64.0.0/10`, never on the public interface. If not, report to Josh; do not change them.
 - Backend state is `Running`. Do not paste the node or tailnet name into git or into this repo.
 - `tailscale funnel status` reports Funnel off (no Funnel endpoints advertised). If it is on, stop and ask Josh.
 
