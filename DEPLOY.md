@@ -21,12 +21,25 @@ Follow these for every step. If a step would violate one, stop and ask Josh.
 1. **Never commit host names, tailnet names, MagicDNS names, or IP addresses** to `vault-search` (or any public git remote). Fill those in only in files on the VPS (`/etc/vault-search/env`, and the nginx config in its own on-box git). If Vault Keeper needs inventory, send it privately to Josh, not as a pull request.
 2. **Never print secrets.** That includes the vault deploy private key, `.env` values, tokens, and audit-log lines that might contain a secret. When a command would display a secret, show only a redacted confirmation (for example "deploy key written, mode 0600") or the **public** key.
 3. **Ask Josh before any firewall or ACL change.** This includes `ufw`/`iptables`/`nftables`, cloud firewall rules, Tailscale ACL / `tagOwners` / auth-key changes, opening a port, and enabling Funnel. Do not make those changes yourself.
-4. **Do not enable Tailscale Funnel** on this node. nginx must listen only on the tailnet MagicDNS name, never on the public IP.
+4. **Do not enable Tailscale Funnel** on this node. Only `tailscale serve` (tailnet-only) answers on the tailnet; nginx and the app listen on loopback only, never on the public IP.
 5. **Bind the app to loopback only** (`LISTEN_HOST=127.0.0.1`). Agents connect over HTTPS to nginx, not with SSH tunnels.
 6. **Admin access is Tailscale SSH**, governed by Tailscale ACLs. Do not add SSH keys as the way to administer the VPS.
 7. **The vault deploy private key never leaves the VPS.** Generate it on the box. Hand only the public key to Josh to add as a read-only deploy key. Do not email, chat, or commit the private key.
 8. **Do not copy vault notes into this repo**, into gist, or into a chat transcript. The private vault checkout stays on the box.
 9. **Do not put the nginx config in this repository.** It already lives in a separate git on the VPS. Add the sample `location` from this runbook to that config; do not invent a second source of truth here.
+
+## Decisions (19 Nov 2026, approved by Josh)
+
+These replace earlier parts of this runbook and the design. Vault Keeper: please keep them unless Josh says otherwise.
+
+- **Architecture follows the existing VPS proxy.** `tailscale serve` terminates TLS on the tailnet at :443 with the `*.ts.net` certificate and forwards to nginx on `127.0.0.1:8080`, which routes `/vault/mcp` to the app on `127.0.0.1:8787`. There is no `tailscale cert` step and no nginx listener on the tailnet IP.
+- **Access control is the tailnet, not the app.** Any tailnet device may call the service. The WhoIs lookup, the denylist, `IDENTITY_SOURCE` and `TAILSCALED_SOCKET` were removed as not needed yet: there is no requirement to restrict callers, and the lookup made every call fail whenever tailscaled was unreachable. If per-device restriction is needed later, put the service on its own tailnet port and restrict it with a Tailscale grant. The app still rejects requests carrying `Tailscale-Funnel-Request`.
+- **The audit log records the caller's tailnet IP** (map it to a device with `tailscale status` when needed) and the unverified `X-Vault-Agent-Name`. Result counts and `zero_hits` are unchanged.
+- **The proxied Host is allowed explicitly.** The MCP SDK rejects non-localhost `Host` headers on a loopback bind (421). The app now also accepts the host in `PUBLIC_BASE_URL`, so that variable is required in production.
+- **No host firewall.** `ufw` is inactive by choice. Isolation comes from nothing listening on the public interface plus the cloud firewall.
+- **Deploy a recorded SHA, not "whatever `main` is".** Updates check out a specific reviewed commit. The `mcp` dependency is pinned to an exact version.
+- **The vault clone uses `core.sshCommand`** in its own `.git/config` instead of a `GIT_SSH_COMMAND` environment variable, and GitHub's host keys are pinned instead of trusted on first use.
+- **Long-running readers follow a rebuilt index file.** After a schema rebuild by the sync timer, the server reopens the new file on its next query; no restart is needed.
 
 ## Ownership split
 
@@ -43,7 +56,7 @@ Do these first, every time you land on the box. RAM and Python are the first che
 - **RAM (v1 is keyword-only):** `free -m` should show at least **512 MB available** (`MemAvailable`). A full-vault fulltext-only index built in 0.16 s and peaked at 23 MB RSS. There is no 2 GB minimum for this default. If available memory is below 512 MB, stop and report to Josh; do not add swap or resize the server yourself.
 - The **2 GB minimum (4 GB comfortable)** applies only when semantic search is enabled later. Indexing with embeddings peaked at about 1.3 GB RSS. Do not install `.[semantic]` until that RAM is in place; see [Enabling semantic search later](#enabling-semantic-search-later).
 - You reached the VPS with **Tailscale SSH** (not a public SSH port you opened, and not an SSH tunnel for agents).
-- `python3 --version` is 3.11 or later; `git`, `systemctl`, `curl`, `nginx`, and `tailscale` are on `PATH`.
+- `python3 --version` is 3.11 or later; `git`, `systemctl`, `curl`, `nginx`, and `tailscale` are on `PATH`. On Debian/Ubuntu, install the matching `python3.X-venv` package so `python3 -m venv` works.
 - `tailscale status` shows this node is online, with MagicDNS and tailnet HTTPS available. Do not paste the node or tailnet name into git.
 - Funnel is off:
 
@@ -54,8 +67,8 @@ Do these first, every time you land on the box. RAM and Python are the first che
   If Funnel is on, **do not turn it off or on yourself** if that might be an ACL/policy change you were not asked to make — stop and ask Josh. The expected state is off.
 - Confirm the node has a tailnet IPv4 address (`tailscale ip -4`) and a public IPv4 address you can use later for the "not reachable on the public IP" check. Write those down only on the box, never in this repo.
 - This public repo is clonable over HTTPS (no token required): `https://github.com/JoshTeperman/vault-search.git`.
-- **Host firewall:** port 443 must be allowed only on the `tailscale0` interface (or only from `100.64.0.0/10`), never on the public interface (e.g. `eth0`). Josh makes firewall changes; check the current rules read-only (`sudo ufw status verbose` or `sudo nft list ruleset`) and report what you see.
-- nginx is already the reverse proxy on this VPS; its config is maintained in Claude's on-box git, not in `vault-search`.
+- **Host firewall:** none, by Josh's decision (see [Decisions](#decisions-19-nov-2026-approved-by-josh)). Check read-only that nothing in this stack listens on the public interface. Josh makes any firewall change.
+- nginx is already the reverse proxy on this VPS, on loopback behind `tailscale serve`; its config is maintained in Claude's on-box git, not in `vault-search`.
 
 ### Completion criteria
 
@@ -71,7 +84,6 @@ Expected:
 
 - `RAM_OK` (at least 512 MB available memory). `RAM_TOO_SMALL` means stop and report. A box with less than 2 GB total is fine for keyword-only v1; do not treat that as a failure.
 - Python is 3.11 or later; all five commands are on `PATH`.
-- Firewall rules (read-only check) allow 443 only on `tailscale0` or from `100.64.0.0/10`, never on the public interface. If not, report to Josh; do not change them.
 - Backend state is `Running`. Do not paste the node or tailnet name into git or into this repo.
 - `tailscale funnel status` reports Funnel off (no Funnel endpoints advertised). If it is on, stop and ask Josh.
 
@@ -83,35 +95,35 @@ Create a dedicated user and the on-box layout. Suggested paths (adjust if the bo
 /var/lib/vault-search/app      # clone of this public repo
 /var/lib/vault-search/vault    # pull-only clone of the private vault
 /var/lib/vault-search/index    # local search index (gitignored in this repo)
-/var/lib/vault-search/models   # local embedding model files
 /var/lib/vault-search/ssh      # read-only vault deploy key (mode 0700 / 0600)
 /var/log/vault-search          # audit log
 /etc/vault-search/env          # environment file, mode 0640, owned by root:vault-search
 ```
 
+`/var/lib/vault-search/models` is only needed once semantic search is enabled.
+
 ```bash
 sudo useradd --system --home /var/lib/vault-search --shell /usr/sbin/nologin vault-search
-sudo usermod -aG tailscale vault-search   # so the service can call WhoIs on the local tailscaled socket
-sudo mkdir -p /var/lib/vault-search/{app,vault,index,models,ssh} /var/log/vault-search /etc/vault-search
+sudo mkdir -p /var/lib/vault-search/{app,vault,index,ssh} /var/log/vault-search /etc/vault-search
 sudo chown -R vault-search:vault-search /var/lib/vault-search /var/log/vault-search
+sudo chmod 0750 /var/lib/vault-search   # holds the private vault
 sudo chmod 0700 /var/lib/vault-search/ssh
 sudo chmod 0750 /etc/vault-search
 ```
 
-Adding the user to the `tailscale` group is so the process can read `/var/run/tailscale/tailscaled.sock` (or `/run/tailscale/tailscaled.sock`) for WhoIs. If the socket's group is different on this box, stop and ask Josh rather than loosening permissions.
+The service does not talk to tailscaled, so it needs no extra group.
 
 ### Completion criteria
 
 ```bash
 id vault-search
-groups vault-search
 stat -c '%A %U:%G %n' /var/lib/vault-search /var/lib/vault-search/ssh /var/log/vault-search /etc/vault-search
 ```
 
 Expected:
 
-- User `vault-search` exists (`id` succeeds) and is in the `tailscale` group.
-- `/var/lib/vault-search` and `/var/log/vault-search` are owned by `vault-search:vault-search`.
+- User `vault-search` exists (`id` succeeds).
+- `/var/lib/vault-search` and `/var/log/vault-search` are owned by `vault-search:vault-search`; `/var/lib/vault-search` is mode `0750`.
 - `/var/lib/vault-search/ssh` is mode `0700`.
 - `/etc/vault-search` is mode `0750`.
 
@@ -119,6 +131,7 @@ Expected:
 
 ```bash
 sudo -u vault-search git clone https://github.com/JoshTeperman/vault-search.git /var/lib/vault-search/app
+sudo -u vault-search git -C /var/lib/vault-search/app checkout --detach <release-sha>   # the reviewed commit to deploy
 sudo -u vault-search git -C /var/lib/vault-search/app rev-parse HEAD   # record this SHA in your report
 ```
 
@@ -148,7 +161,7 @@ Expected:
 
 - `origin` is `https://github.com/JoshTeperman/vault-search.git` (HTTPS, no token in the URL).
 - The working tree is clean (`status --porcelain` is empty).
-- `HEAD` equals `origin/main`. Record that SHA in the report.
+- `HEAD` is the intended release SHA (normally a commit on `origin/main`). Record that SHA in the report.
 - After the venv step, `/var/lib/vault-search/app/.venv/bin/python` is executable.
 - The venv prints `KEYWORD_ONLY` (`fastembed` is not installed).
 - The model directory file count is `0`. No model cache is expected for v1.
@@ -175,7 +188,18 @@ The vault stays in the private repo `JoshTeperman/knowledge-vault`. The VPS gets
    sudo -u vault-search cat /var/lib/vault-search/ssh/vault_deploy.pub
    ```
 
-3. Once the key is in place, clone over SSH using a dedicated config that points at this key only:
+3. Ask Josh to leave **Allow write access** unticked when adding the key; that is what makes it read-only.
+
+4. Pin GitHub's SSH host keys instead of trusting on first use. Copy them from GitHub's published list (`https://api.github.com/meta`, `ssh_keys`, or the "GitHub's SSH key fingerprints" docs page) and check the fingerprints against that page:
+
+   ```bash
+   curl -fsS https://api.github.com/meta \
+     | python3 -c 'import json,sys; [print("github.com", k) for k in json.load(sys.stdin)["ssh_keys"]]' \
+     | sudo -u vault-search tee /var/lib/vault-search/ssh/known_hosts >/dev/null
+   sudo -u vault-search ssh-keygen -lf /var/lib/vault-search/ssh/known_hosts
+   ```
+
+5. Once the key is in place, clone over SSH using a dedicated config that points at this key only:
 
    ```bash
    sudo -u vault-search tee /var/lib/vault-search/ssh/config >/dev/null <<'EOF'
@@ -184,23 +208,24 @@ The vault stays in the private repo `JoshTeperman/knowledge-vault`. The VPS gets
      User git
      IdentityFile /var/lib/vault-search/ssh/vault_deploy
      IdentitiesOnly yes
-     StrictHostKeyChecking accept-new
+     UserKnownHostsFile /var/lib/vault-search/ssh/known_hosts
+     StrictHostKeyChecking yes
    EOF
    sudo chmod 0600 /var/lib/vault-search/ssh/config
-   sudo -u vault-search git clone git@github-vault:JoshTeperman/knowledge-vault.git /var/lib/vault-search/vault
+   sudo -u vault-search git clone \
+     -c core.sshCommand="ssh -F /var/lib/vault-search/ssh/config" \
+     git@github-vault:JoshTeperman/knowledge-vault.git /var/lib/vault-search/vault
    ```
 
-   Put `GIT_SSH_COMMAND="ssh -F /var/lib/vault-search/ssh/config"` in the environment for clone, pull, and the timer.
+   `-c core.sshCommand=…` is saved in the vault clone's own `.git/config`, so every later `git pull` in that checkout (the sync timer, or by hand from any directory) uses the deploy key. Do **not** also set `GIT_SSH_COMMAND`; it would override this.
 
-4. Disable push on that clone:
+6. Disable push on that clone:
 
    ```bash
    sudo -u vault-search git -C /var/lib/vault-search/vault remote set-url --push origin DISABLED
    ```
 
    Confirm a test `git push` is rejected. Confirm the private key is not in the vault working tree, not in the `vault-search` working tree, and not in the public repo.
-
-A systemd timer that pulls `main` belongs to milestone 3; do not invent a cron job that writes vault content into this repo.
 
 ### Completion criteria
 
@@ -210,8 +235,8 @@ A systemd timer that pulls `main` belongs to milestone 3; do not invent a cron j
 stat -c '%a %n' /var/lib/vault-search/ssh/vault_deploy /var/lib/vault-search/ssh/vault_deploy.pub
 sudo -u vault-search git -C /var/lib/vault-search/vault rev-parse HEAD
 sudo -u vault-search git -C /var/lib/vault-search/vault remote get-url --push origin
-sudo -u vault-search env GIT_SSH_COMMAND='ssh -F /var/lib/vault-search/ssh/config' \
-  git -C /var/lib/vault-search/vault push origin HEAD
+sudo -u vault-search git -C /var/lib/vault-search/vault config core.sshCommand
+sudo -u vault-search git -C /var/lib/vault-search/vault push origin HEAD
 # The private key must not appear in either working tree:
 sudo -u vault-search git -C /var/lib/vault-search/vault ls-files | grep -E 'vault_deploy$|id_ed25519' && echo 'FAIL: key in vault tree' || true
 sudo -u vault-search git -C /var/lib/vault-search/app ls-files | grep -E 'vault_deploy$|id_ed25519' && echo 'FAIL: key in app tree' || true
@@ -222,6 +247,7 @@ Expected:
 - Private key mode is `600`; public key is readable.
 - `HEAD` is a real commit SHA (hash only in the report; no vault file contents).
 - `remote get-url --push origin` is `DISABLED`.
+- `core.sshCommand` is `ssh -F /var/lib/vault-search/ssh/config`.
 - `git push` is rejected (non-zero exit; no objects sent).
 - Neither `grep` prints `FAIL`. Never paste the private key.
 
@@ -246,25 +272,22 @@ Suggested production values (adjust paths if you used a different layout):
 | `EMBEDDING_CACHE_DIR` | leave unset for v1. Use `/var/lib/vault-search/models` only when enabling semantic search later |
 | `EMBEDDING_MODEL_PATH` | leave unset for v1 |
 | `AUDIT_LOG_PATH` | `/var/log/vault-search/audit.jsonl` |
-| `DENYLIST` | optional comma-separated device names, tags, or logins |
-| `DENYLIST_PATH` | `/etc/vault-search/denylist` (create an empty file if unused) |
 | `LISTEN_HOST` | `127.0.0.1` (required) |
 | `LISTEN_PORT` | `8787` (or another free loopback port) |
 | `MCP_PATH` | `/vault/mcp` |
 | `LISTEN_ALLOW_NONLOCAL` | leave unset (the process refuses `0.0.0.0` / `::` without it) |
-| `PUBLIC_BASE_URL` | `https://<vps>.<tailnet>.ts.net` — use the real MagicDNS name **only** in this on-box file |
-| `IDENTITY_SOURCE` | `whois` (required under nginx; see [Caller identity](#8-caller-identity-audit-log-and-denylist)) |
-| `TAILSCALED_SOCKET` | `/var/run/tailscale/tailscaled.sock` (use `/run/tailscale/tailscaled.sock` if that is what the box has) |
+| `PUBLIC_BASE_URL` | `https://<vps>.<tailnet>.ts.net` — required: the app accepts this `Host` from the proxy. Use the real MagicDNS name **only** in this on-box file |
 
 Leave the `EMBEDDING_*` variables unset for this deploy. Setting a cache directory does not enable semantic search; that requires `pip install '.[semantic]'` and a reindex, and must not be done until the RAM check in [Enabling semantic search later](#enabling-semantic-search-later) passes.
 
-`LISTEN_HOST` must stay loopback. Do not set it to `0.0.0.0`, to a public IP, or to the tailnet IP; nginx is what listens on the tailnet. The process refuses a wildcard bind unless `LISTEN_ALLOW_NONLOCAL=1`.
+`LISTEN_HOST` must stay loopback. Do not set it to `0.0.0.0`, to a public IP, or to the tailnet IP; `tailscale serve` is what answers on the tailnet. The process refuses a wildcard bind unless `LISTEN_ALLOW_NONLOCAL=1`.
 
 ### Completion criteria
 
 ```bash
 stat -c '%a %U:%G %n' /etc/vault-search/env
-sudo grep -E '^(LISTEN_HOST|LISTEN_PORT|MCP_PATH|IDENTITY_SOURCE)=' /etc/vault-search/env
+sudo grep -E '^(LISTEN_HOST|LISTEN_PORT|MCP_PATH)=' /etc/vault-search/env
+sudo grep -cE '^PUBLIC_BASE_URL=https://' /etc/vault-search/env   # 1; do not print the value
 sudo grep -E '^(EMBEDDING_CACHE_DIR|EMBEDDING_MODEL_PATH)=' /etc/vault-search/env || true
 if [ -d /var/lib/vault-search/models ]; then find /var/lib/vault-search/models -type f | wc -l; else echo 0; fi
 ```
@@ -275,7 +298,7 @@ Expected:
 - `LISTEN_HOST=127.0.0.1`
 - `LISTEN_PORT` is a port (default `8787`)
 - `MCP_PATH=/vault/mcp`
-- `IDENTITY_SOURCE=whois`
+- `PUBLIC_BASE_URL` is set (count `1`).
 - `EMBEDDING_CACHE_DIR` and `EMBEDDING_MODEL_PATH` are unset (or empty). No model cache is expected for v1.
 - Do not paste other env values (paths, `PUBLIC_BASE_URL`) into git.
 
@@ -288,25 +311,40 @@ Write `/etc/systemd/system/vault-search.service`:
 ```ini
 [Unit]
 Description=vault-search MCP service
-After=network-online.target tailscaled.service
-Wants=network-online.target
-Requires=tailscaled.service
+After=network.target
 
 [Service]
 Type=exec
 User=vault-search
 Group=vault-search
-SupplementaryGroups=tailscale
 EnvironmentFile=/etc/vault-search/env
 WorkingDirectory=/var/lib/vault-search/app
 ExecStart=/var/lib/vault-search/app/.venv/bin/python -m vault_search.mcp
 Restart=on-failure
 RestartSec=5
+UMask=0027
+# Loopback only, in and out: the server never makes network calls.
+IPAddressDeny=any
+IPAddressAllow=localhost
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/vault-search/index /var/log/vault-search
 NoNewPrivileges=yes
 PrivateTmp=yes
+PrivateDevices=yes
 ProtectSystem=strict
 ProtectHome=yes
-ReadWritePaths=/var/lib/vault-search /var/log/vault-search
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+SystemCallArchitectures=native
 
 [Install]
 WantedBy=multi-user.target
@@ -327,7 +365,7 @@ Write `/etc/systemd/system/vault-search-sync.service` (a oneshot, not a long-run
 ```ini
 [Unit]
 Description=vault-search pull-only vault sync and reindex
-After=network-online.target tailscaled.service
+After=network-online.target
 Wants=network-online.target
 
 [Service]
@@ -338,11 +376,26 @@ EnvironmentFile=/etc/vault-search/env
 WorkingDirectory=/var/lib/vault-search/app
 ExecStart=/var/lib/vault-search/app/.venv/bin/python -m vault_search sync
 Nice=10
+UMask=0027
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/vault-search/vault /var/lib/vault-search/index /var/log/vault-search
 NoNewPrivileges=yes
 PrivateTmp=yes
+PrivateDevices=yes
 ProtectSystem=strict
 ProtectHome=yes
-ReadWritePaths=/var/lib/vault-search /var/log/vault-search
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+SystemCallArchitectures=native
 ```
 
 And `/etc/systemd/system/vault-search-sync.timer`:
@@ -368,7 +421,7 @@ sudo systemctl enable --now vault-search-sync.timer
 systemctl list-timers vault-search-sync.timer
 ```
 
-`python -m vault_search sync` runs `git pull --ff-only` in `VAULT_ROOT` and then reindexes. On the v1 keyword-only install this is a full-text rebuild only (no embeddings, no model cache). Embeddings are written only for new or changed chunks after the semantic extra is installed; see [Enabling semantic search later](#enabling-semantic-search-later). It refuses to run if `VAULT_ROOT` is not itself a git checkout. A failed non-fast-forward pull fails the unit and does not rewrite the index.
+`python -m vault_search sync` runs `git pull --ff-only` in `VAULT_ROOT` and then reindexes. On the v1 keyword-only install this is a full-text rebuild only (no embeddings, no model cache). Embeddings are written only for new or changed chunks after the semantic extra is installed; see [Enabling semantic search later](#enabling-semantic-search-later). It refuses to run if `VAULT_ROOT` is not itself a git checkout. A failed non-fast-forward pull fails the unit and does not rewrite the index. The pull authenticates through the clone's `core.sshCommand` (section 4); the env file needs no SSH setting. If a release changes the index schema, the sync deletes and rebuilds the file; the running server reopens it on its next query.
 
 ### Completion criteria
 
@@ -433,46 +486,32 @@ Expected:
 
 ## 7. nginx in front of the app
 
-**Available from milestone 6.** This VPS already runs nginx. Its config lives on the VPS, in Claude's own git — not in `vault-search`. You add (and maintain) a site and a `location /vault/mcp` there.
+**Available from milestone 6.** This VPS already runs `tailscale serve` → nginx. Its config lives on the VPS, in Claude's own git — not in `vault-search`.
 
-One HTTPS server listens **only** on the node's tailnet MagicDNS name, never on the public IP and never on `0.0.0.0`. Each service on the box gets its own path or subdomain. This service uses `/vault/mcp`. Agents call `https://<vps>.<tailnet>.ts.net/vault/mcp` over HTTPS, not an SSH tunnel.
-
-TLS certificates come from Tailscale, not from a public CA:
-
-```bash
-# Run on the VPS. Writes a cert and key for the MagicDNS name.
-# Put the files where the on-box nginx config expects them; do not commit them here.
-tailscale cert <vps>.<tailnet>.ts.net
+```text
+tailnet ──HTTPS──▶ tailscaled :443 ──HTTP──▶ nginx 127.0.0.1:8080 ──▶ vault-search 127.0.0.1:8787
+                  (tailscale serve,           (location /vault/mcp)
+                   TLS + *.ts.net cert)
 ```
 
-Sample server and location snippet for the on-box nginx config. Fill in the placeholders on the box only. `proxy_pass` has no trailing slash, so the `/vault/mcp` prefix is forwarded to the app (which uses `MCP_PATH=/vault/mcp`).
+`tailscale serve` is tailnet-only and handles TLS and certificate renewal, so there is no `tailscale cert` step. It sets `X-Forwarded-For` to the caller's tailnet IP; the on-box nginx config turns that into `$remote_addr` with `real_ip_header` trusted only from loopback.
+
+Add this `location` to the existing loopback `server` in the on-box nginx config. `proxy_pass` has no trailing slash, so the `/vault/mcp` prefix is forwarded to the app (which uses `MCP_PATH=/vault/mcp`).
 
 ```nginx
-server {
-    listen <tailnet-ipv4>:443 ssl;
-    # Optional: listen [<tailnet-ipv6>]:443 ssl;
-    # Do not listen on 0.0.0.0, *, or the public IP.
-    server_name <vps>.<tailnet>.ts.net;
-
-    ssl_certificate     /path/on/box/<vps>.<tailnet>.ts.net.crt;
-    ssl_certificate_key /path/on/box/<vps>.<tailnet>.ts.net.key;
-
-    location /vault/mcp {
-        proxy_pass http://127.0.0.1:8787;
-        proxy_http_version 1.1;
-        proxy_buffering off;
-        proxy_request_buffering off;
-        proxy_read_timeout 1h;
-        proxy_send_timeout 1h;
-        # Streamable HTTP is a long-lived HTTP/1.1 response, not WebSocket.
-        proxy_set_header Connection "";
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        # Set from $remote_addr only. Do not use $proxy_add_x_forwarded_for
-        # (that would honour a client-supplied value).
-        proxy_set_header X-Forwarded-For $remote_addr;
-        proxy_set_header X-Forwarded-Proto $scheme;
-    }
+location /vault/mcp {
+    proxy_pass http://127.0.0.1:8787;
+    proxy_http_version 1.1;
+    proxy_buffering off;
+    proxy_request_buffering off;
+    proxy_read_timeout 1h;
+    proxy_send_timeout 1h;
+    # Streamable HTTP is a long-lived HTTP/1.1 response, not WebSocket.
+    proxy_set_header Connection "";
+    proxy_set_header Host $host;   # must match PUBLIC_BASE_URL's host
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $remote_addr;
+    proxy_set_header X-Forwarded-Proto https;
 }
 ```
 
@@ -482,9 +521,7 @@ After editing the on-box config (in its own git):
 sudo nginx -t && sudo systemctl reload nginx
 ```
 
-nginx does not inject Tailscale identity headers. The app must resolve the caller with a WhoIs lookup on the client IP taken from `X-Real-IP` or `X-Forwarded-For`, and it must trust those headers **only** when the immediate TCP peer is localhost. See [Caller identity](#8-caller-identity-audit-log-and-denylist).
-
-Fallback only: if nginx were unavailable, Tailscale Serve could path-mount the same loopback app (`tailscale serve --bg --set-path=/vault/mcp http://127.0.0.1:8787/vault/mcp`). This VPS uses nginx; do not enable Serve (or Funnel) on port 443 alongside nginx without Josh's approval. Serve identity headers are blank for tagged nodes anyway, so WhoIs would still be required.
+Do not change the `tailscale serve` mapping or enable Funnel without Josh's approval.
 
 ### Completion criteria
 
@@ -501,30 +538,17 @@ Expected:
 
 - `nginx -t` prints `syntax is ok` and `test is successful`.
 - `systemctl is-active nginx` prints `active`.
-- `ss -tlnp` shows this stack only as: the app on `127.0.0.1:8787`, and nginx on `<tailnet-ip>:443`. Nothing in this stack listens on the public IP or on `0.0.0.0`/`*`.
+- `ss -tlnp` shows this stack only as: the app on `127.0.0.1:8787`, nginx on `127.0.0.1:8080`, and tailscaled on `<tailnet-ip>:443`. Nothing in this stack listens on the public IP or on `0.0.0.0`/`*`.
 - `tailscale funnel status` is still off.
 - From another tailnet node, the endpoint in section 9 answers. From off the tailnet, a curl to the public IP fails.
 
-## 8. Caller identity, audit log, and denylist
+## 8. Caller details and audit log
 
-The service records caller identity on every tool call and rejects callers who are not on the tailnet, or who are on the service denylist. WhoIs identifies the **device**. **nginx does not inject Tailscale identity.** Tagged nodes are the later per-agent path; they are not how the shared Grok Bot box appears today.
+Access control is the tailnet: only tailnet devices can reach `tailscale serve`, and the app does not authorise callers itself (see [Decisions](#decisions-19-nov-2026-approved-by-josh)). It rejects only requests that carry `Tailscale-Funnel-Request`, as defence in depth.
 
-**`IDENTITY_SOURCE=whois`.** The app reads `X-Real-IP` or `X-Forwarded-For` (set by nginx from `$remote_addr`) only when the immediate TCP peer is `127.0.0.1`. It then looks up that client address on the local tailscaled socket:
+The app takes the caller's IP from `X-Real-IP` / `X-Forwarded-For` **only** when the immediate TCP peer is loopback (nginx); otherwise it uses the peer address. That IP is the caller's tailnet address, which `tailscale status` maps to a device. A self-reported `X-Vault-Agent-Name` header is recorded when present and marked **unverified**; it is not used for anything else.
 
-```bash
-curl --unix-socket /var/run/tailscale/tailscaled.sock \
-  "http://local-tailscaled.sock/localapi/v0/whois?addr=<client-ip>:<client-port>"
-```
-
-The response includes node name and tags, and a user profile when the node is not tagged. For tagged nodes, the login field is not a useful user identity (it is the tagged-devices profile); log the **node name and tags** instead. Do not paste WhoIs output that contains real names into git.
-
-**Identity v1 (as of 17 Nov 2026).** The shared Grok Bot box used by all of Josh's agents is on the tailnet through the Tailscale connector. It is a single **untagged** device carrying Josh's identity, meant for **read and verify only**, and it can reach tailnet hosts over HTTP(S)/TCP. WhoIs cannot tell agents on that box apart. Identity v1 is the device, plus a self-reported `X-Vault-Agent-Name` header. The audit log records the header when present and marks it **unverified**. The header is not used for authorisation or revocation. **Revocation is per device** (overlay ACL, device removal, or the service denylist). True per-agent identity comes later, from separate tagged devices or MCP OAuth through the gateway. This same box is Vault Keeper's verification node for the criteria in [End-to-end verification](#9-end-to-end-verification). Do not write real host or tailnet names in this repo.
-
-The service user must be able to read that socket (see [Service user and directories](#2-service-user-and-directories)). If a request has no trusted client IP, or WhoIs does not recognise it as a tailnet node, reject the call.
-
-If a request carries `Tailscale-Funnel-Request`, reject it. Funnel is supposed to be off; this is defence in depth.
-
-The audit log (`AUDIT_LOG_PATH`) is append-only on the box. Each line should include timestamp, caller (node, tags, user if any), tool, arguments, `result_count`, and whether a secret-like span was masked (rule, path, span — not the secret). Search calls that return no hits are logged with `result_count` 0 and `zero_hits` true; Vault Keeper uses those counts to decide whether to enable semantic search. Do not log secret values, vault body text, or values you would not want copied off the box. Do not commit the log.
+The audit log (`AUDIT_LOG_PATH`) is append-only JSON lines on the box. Each line includes timestamp, `client_ip`, `agent_name_unverified`, tool, masked arguments, `result_count`, `masked_hits`, and `zero_hits` for searches with no results. Vault Keeper uses those counts to decide whether to enable semantic search. Do not log secret values or vault body text. Do not commit the log.
 
 ### Completion criteria
 
@@ -532,14 +556,14 @@ The audit log (`AUDIT_LOG_PATH`) is append-only on the box. Each line should inc
 
 ```bash
 # On the VPS, after the tailnet curl / verify-deploy run:
-sudo tail -n 20 /var/log/vault-search/audit.log
+sudo tail -n 20 /var/log/vault-search/audit.jsonl
 ```
 
 Expected:
 
-- A new line exists for the `initialize` or `tools/list` (and, if run, the fixture `read_note`/`search`) call.
-- The line includes a caller **device** identity (node name and tags, or a user login if the caller was not tagged). If `X-Vault-Agent-Name` was sent, the line includes it and marks it **unverified**.
-- The line does **not** contain secret values or vault body text. In the report, quote only outcome and whether identity was present — not a raw log dump, not WhoIs JSON, not real host names.
+- A new line exists for the fixture `read_note` / `search` call.
+- The line's `client_ip` is the calling device's tailnet IP (not `127.0.0.1`). If `X-Vault-Agent-Name` was sent, it appears as `agent_name_unverified`.
+- The line does **not** contain secret values or vault body text. In the report, quote only the outcome — not a raw log dump, not IPs or host names.
 
 ## 9. End-to-end verification
 
@@ -547,7 +571,7 @@ Expected:
 
 Run the on-box commands on the VPS. Run the HTTP commands (or `scripts/verify-deploy`) from a **different** node on the tailnet, and the public-IP curl from a host that is **not** on the tailnet. Do not commit commands with real names filled in.
 
-Claude's passing output is not acceptance. Vault Keeper re-runs these checks from the shared Grok Bot box (the verification node; untagged, Josh's identity, read/verify only — see [Caller identity](#8-caller-identity-audit-log-and-denylist)) with `scripts/verify-deploy` (externally visible criteria) and the on-box commands over Tailscale SSH.
+Claude's passing output is not acceptance. Vault Keeper re-runs these checks from the shared Grok Bot box (the verification node; untagged, Josh's identity, read/verify only) with `scripts/verify-deploy` (externally visible criteria) and the on-box commands over Tailscale SSH.
 
 1. **systemd is active** (on the VPS):
 
@@ -588,7 +612,7 @@ Claude's passing output is not acceptance. Vault Keeper re-runs these checks fro
    ss -tlnp
    ```
 
-   Expected: vault-search on `127.0.0.1` only; nginx on the tailnet IP port 443 only; neither on the public IP nor on `0.0.0.0`/`*`.
+   Expected: vault-search and nginx on `127.0.0.1` only; tailscaled on the tailnet IP port 443; nothing in this stack on the public IP or on `0.0.0.0`/`*`.
 
    From a host off the tailnet (also run by `scripts/verify-deploy` when `PUBLIC_IP` is set):
 
@@ -605,11 +629,9 @@ Claude's passing output is not acceptance. Vault Keeper re-runs these checks fro
    # expected: off (no Funnel endpoints)
    ```
 
-6. **The audit log records the caller identity** — see [section 8 completion criteria](#completion-criteria-2).
+6. **The audit log records the caller's tailnet IP** — see [section 8 completion criteria](#8-caller-details-and-audit-log).
 
-7. **Denylist** (once a test identity is available): adding a caller to `DENYLIST_PATH` and retrying should be rejected and audit-logged. Remove the test entry afterwards.
-
-8. **The built index contains no unmasked secrets** (on the VPS). This is an on-box check; `scripts/verify-deploy` does not run it, because that script only covers externally visible HTTP criteria.
+7. **The built index contains no unmasked secrets** (on the VPS). This is an on-box check; `scripts/verify-deploy` does not run it, because that script only covers externally visible HTTP criteria.
 
    ```bash
    sudo -u vault-search /var/lib/vault-search/app/.venv/bin/python -m vault_search index-audit /var/lib/vault-search/index/vault.db
@@ -628,8 +650,7 @@ Claude's passing output is not acceptance. Vault Keeper re-runs these checks fro
 ```bash
 sudo -u vault-search git -C /var/lib/vault-search/app fetch origin
 sudo -u vault-search git -C /var/lib/vault-search/app rev-parse HEAD   # previous SHA, for rollback
-sudo -u vault-search git -C /var/lib/vault-search/app checkout main
-sudo -u vault-search git -C /var/lib/vault-search/app pull --ff-only origin main
+sudo -u vault-search git -C /var/lib/vault-search/app checkout --detach <release-sha>
 sudo -u vault-search /var/lib/vault-search/app/.venv/bin/pip install -e /var/lib/vault-search/app
 sudo systemctl restart vault-search    # only once the unit is enabled
 ```
@@ -644,7 +665,7 @@ sudo -u vault-search /var/lib/vault-search/app/.venv/bin/python -m vault_search 
 sudo systemctl restart vault-search    # only once the unit is enabled
 ```
 
-If the unit is restarted before that reindex, it will open an empty rebuilt file and searches will return nothing until `python -m vault_search index` or the sync timer runs.
+If the unit is restarted before that reindex, it will open an empty rebuilt file and searches will return nothing until `python -m vault_search index` or the sync timer runs. The server reopens the file when the reindex replaces it.
 
 Re-run [section 9](#9-end-to-end-verification). If the unit is not yet enabled (pre-milestone 6), skip the restart.
 
@@ -664,13 +685,13 @@ systemctl is-active vault-search    # after milestone 6
 
 Expected:
 
-- For an update: `HEAD` equals `origin/main` and equals the intended release SHA; the previous SHA was recorded first.
+- For an update: `HEAD` equals the intended release SHA; the previous SHA was recorded first.
 - For a rollback: `HEAD` equals the recorded previous SHA.
 - After milestone 6, `systemctl is-active vault-search` is `active`, and section 9 still passes (including Vault Keeper's independent `scripts/verify-deploy` run).
 
 ## 11. Report back template
 
-Send the filled template privately (not as a commit to this repo). Do not include host names, tailnet names, IP addresses, `.env` values, private keys, tokens, vault note content, or raw audit/WhoIs dumps. If inventory names are needed, send them to Josh privately.
+Send the filled template privately (not as a commit to this repo). Do not include host names, tailnet names, IP addresses, `.env` values, private keys, tokens, vault note content, or raw audit-log dumps. If inventory names are needed, send them to Josh privately.
 
 This report is **not** acceptance. Vault Keeper re-runs the completion criteria from the shared Grok Bot box, which is the verification node (`scripts/verify-deploy` for the externally visible checks, plus the on-box commands over Tailscale SSH), before calling the milestone done.
 
@@ -685,14 +706,14 @@ Previous SHA (for an update/rollback, otherwise "n/a"):
 systemd is-enabled / is-active (paste the two words only):
 nginx -t (ok / FAIL):
 nginx is-active:
-ss -tlnp summary (app on 127.0.0.1? nginx on tailnet :443 only? nothing on public IP or 0.0.0.0? yes/no, no addresses):
+ss -tlnp summary (app and nginx on 127.0.0.1? tailscaled on tailnet :443? nothing on public IP or 0.0.0.0? yes/no, no addresses):
 Funnel (expected: off):
 
 MCP initialize / tools/list (pass/fail; list tool names only):
 Masked fixture query (pass/fail; say whether [REDACTED:] appeared; do not paste the secret):
 Index audit (`python -m vault_search index-audit`; pass/fail; rule names only, no findings dump):
 Public IP curl (failed as expected / UNEXPECTED SUCCESS):
-Audit log: caller identity present (yes/no; node/tags or user; no log dump):
+Audit log: caller tailnet IP present (yes/no; no IPs, no log dump):
 
 Deploy key public half (first time only; never the private key):
 Blockers / questions for Josh (ask before any firewall or ACL change):

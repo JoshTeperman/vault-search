@@ -44,16 +44,12 @@ Runtime configuration comes from the environment (or a gitignored `.env`). This 
 | `EMBEDDING_CACHE_DIR` | Unused in v1. Directory for downloaded ONNX model files (gitignored) once semantic search is enabled. |
 | `EMBEDDING_MODEL_PATH` | Unused in v1. Optional path to a pre-fetched model directory. Vault text is not sent to a hosted embedding API. |
 | `INDEX_INCLUDE_EXAMPLES` | Set to `1` to index `wiki/_examples` and pages marked `example: true`. Off by default. |
-| `DENYLIST` | Comma-separated device names, tags, or logins to reject. |
 | `AUDIT_LOG_PATH` | Path to the append-only audit log. |
-| `DENYLIST_PATH` | Optional path to a caller denylist (defence in depth, on top of overlay-network access rules). |
 | `LISTEN_HOST` | Bind address. Must be `127.0.0.1` in production; the reverse proxy listens on the tailnet. Binding `0.0.0.0` or `::` is refused unless `LISTEN_ALLOW_NONLOCAL=1`. |
 | `LISTEN_ALLOW_NONLOCAL` | Set to `1` only if you really mean to bind a non-loopback address. Leave unset in production. |
 | `LISTEN_PORT` | Bind port on loopback. |
 | `MCP_PATH` | URL path the proxy mounts, default `/vault/mcp`. The public endpoint is `https://<vps>.<tailnet>.ts.net/vault/mcp` (placeholders only). |
-| `PUBLIC_BASE_URL` | Tailnet-only base URL, for example `https://<vps>.<tailnet>.ts.net`. Use the real MagicDNS name only in the on-box env file. |
-| `IDENTITY_SOURCE` | How the app identifies the caller. Production is `whois` (nginx does not inject Tailscale identity). See [Caller identity](#caller-identity-and-exposure). |
-| `TAILSCALED_SOCKET` | Path to the local tailscaled Unix socket used for WhoIs, usually `/var/run/tailscale/tailscaled.sock`. |
+| `PUBLIC_BASE_URL` | Tailnet-only base URL, for example `https://<vps>.<tailnet>.ts.net`. Required behind the proxy: the server accepts this `Host` header (the MCP SDK otherwise answers 421 to non-localhost hosts). Use the real MagicDNS name only in the on-box env file. |
 
 Copy `.env.example` to `.env` when running locally. Never commit `.env` or any filled-in values.
 
@@ -90,13 +86,11 @@ Rules cover common token formats (GitHub, OpenAI, Anthropic, AWS, Slack, Google)
 
 **Audit log.** Every tool call is appended to the log at `AUDIT_LOG_PATH`: timestamp, caller identity, tool, arguments, `result_count`, and whether a secret-like span was masked (rule, path, span — not the secret value). Search calls that return no hits are logged with `result_count` 0 and `zero_hits` true. Vault Keeper uses those result counts to decide whether to enable semantic search later. Do not log secret values or vault body text. The log stays on the host; it is not committed here.
 
-**Caller identity and exposure.** The service is reachable only on a private tailnet, not the public internet. nginx on the VPS listens on the node's MagicDNS name only and serves this app at `https://<vps>.<tailnet>.ts.net/vault/mcp` (placeholders; never commit real names). TLS certificates come from `tailscale cert`. The nginx config lives in a separate git on the VPS, not in this repo. The systemd unit binds to `127.0.0.1` only. Agents connect over HTTPS, not SSH tunnels. Admin access is Tailscale SSH, governed by ACLs, not SSH keys. Funnel stays off.
+**Exposure and access.** The service is reachable only on a private tailnet, not the public internet. On the VPS, `tailscale serve` terminates TLS on the tailnet and forwards to nginx on loopback, which serves this app at `https://<vps>.<tailnet>.ts.net/vault/mcp` (placeholders; never commit real names). The nginx config lives in a separate git on the VPS, not in this repo. The systemd unit binds to `127.0.0.1` only. Agents connect over HTTPS, not SSH tunnels. Admin access is Tailscale SSH, governed by ACLs, not SSH keys. Funnel stays off.
 
-Caller identity is recorded on every call and used for the denylist. **`IDENTITY_SOURCE=whois` is required under nginx:** nginx does not inject Tailscale identity. It sets `X-Real-IP` and `X-Forwarded-For` from `$remote_addr`. The app trusts those headers only when the immediate TCP peer is loopback, then looks up the client address via the local tailscaled socket (`GET /localapi/v0/whois?addr=...` on `TAILSCALED_SOCKET`). That returns node name and tags, and a user profile when the node is not tagged. Reject requests that carry `Tailscale-Funnel-Request`.
+Access control is the tailnet itself: every tailnet device may call the service, and the app does not authorise callers. It rejects only requests that carry `Tailscale-Funnel-Request`. If per-device restriction is needed later, put the service on its own tailnet port and restrict it with a Tailscale grant. (A WhoIs lookup and denylist were removed on 19 Nov 2026 as not needed yet; see the Decisions section in [DEPLOY.md](DEPLOY.md).)
 
-A caller that is not on the tailnet, or that is on the denylist, is rejected.
-
-**Identity v1 (as of 17 Nov 2026).** The shared Grok Bot box used by all of Josh's agents is on the tailnet through the Tailscale connector. It is a single **untagged** device carrying Josh's identity, meant for **read and verify only**, and it can reach tailnet hosts over HTTP(S)/TCP. WhoIs therefore cannot tell agents on that box apart: every call looks like the same user-owned node. Identity v1 is the **device** (WhoIs), plus a self-reported `X-Vault-Agent-Name` header. The audit log records the header when present and marks it **unverified**. The header is not used for authorisation or revocation. **Revocation is per device** (overlay ACL, device removal, or the service denylist). True per-agent identity comes later, from separate tagged devices or MCP OAuth through the gateway. Do not write real host or tailnet names in this repo.
+**Caller details.** The audit log records the caller's tailnet IP, taken from `X-Real-IP` / `X-Forwarded-For` only when the TCP peer is loopback (nginx), plus a self-reported `X-Vault-Agent-Name` header marked **unverified**. The shared Grok Bot box used by all of Josh's agents is one device, so agents on it are told apart only by that unverified header.
 
 This same shared box is Vault Keeper's **verification node** for the [DEPLOY.md](DEPLOY.md) completion criteria. A report from the VPS deploy executor is not acceptance.
 
@@ -104,7 +98,7 @@ This same shared box is Vault Keeper's **verification node** for the [DEPLOY.md]
 
 Vault Keeper owns the code in this repository. Deployment on the VPS is done by pulling a release and following [DEPLOY.md](DEPLOY.md): service user, pull-only vault clone, loopback systemd unit, and an nginx `location /vault/mcp` in the on-box nginx git. The MCP server in this repo binds to loopback and is meant to sit behind the VPS nginx location. The runbook has checkable completion criteria for the VPS steps, which are still blocked on access.
 
-Vault Keeper independently verifies a deploy from the shared Grok Bot box (the verification node; see [Caller identity](#caller-identity-and-exposure)). A report from the VPS agent is not acceptance. For the externally visible checks (MCP `initialize` / `tools/list`, masked fixture query, public IP must fail):
+Vault Keeper independently verifies a deploy from the shared Grok Bot box (the verification node; see [Caller details](#exposure-and-access)). A report from the VPS agent is not acceptance. For the externally visible checks (MCP `initialize` / `tools/list`, masked fixture query, public IP must fail):
 
 ```bash
 # Real values only in the shell, never committed.
@@ -152,12 +146,12 @@ python -m vault_search index-audit index/vault.db
 3. **Pull-only vault sync on the VPS** — blocked on VPS access.
 4. **Index and CLI** — done in this tree. SQLite FTS5 over `wiki/`, heading chunks, backlinks, compact masked markdown, ingest-time secret masking, incremental reindex.
 5. **Hybrid search** — done in this tree, optional. The v1 deploy is keyword-only (no `[semantic]` extra). Installing `fastembed` (`BAAI/bge-small-en-v1.5`, ONNX, CPU) and reindexing attaches vectors to `chunk_embeddings` and turns on RRF hybrid (k=60).
-6. **MCP server** — done in this tree (loopback Streamable HTTP, WhoIs identity, denylist, audit log, `scripts/verify-deploy`). Binding it to the VPS tailnet is still blocked on VPS access; see [DEPLOY.md](DEPLOY.md).
+6. **MCP server** — done in this tree (loopback Streamable HTTP, audit log with caller IP, `scripts/verify-deploy`). Binding it to the VPS tailnet is still blocked on VPS access; see [DEPLOY.md](DEPLOY.md).
 7. **Adapter-ready** — tool contract documented for a future gateway; no other data sources.
 
 ## Development
 
-Requires Python 3.11 or later. The core indexer is stdlib plus the official `mcp` SDK (also listed in the `dev` extra). Local embeddings are optional: `pip install '.[semantic]'` (fastembed/ONNX, not torch). The v1 deploy does not install that extra.
+Requires Python 3.11 or later. The core indexer is stdlib plus the official `mcp` SDK, pinned to an exact version (also listed in the `dev` extra). Local embeddings are optional: `pip install '.[semantic]'` (fastembed/ONNX, not torch). The v1 deploy does not install that extra.
 
 ```bash
 python -m pip install -e ".[dev]"

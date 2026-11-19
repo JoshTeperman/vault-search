@@ -1,4 +1,4 @@
-"""MCP server: bind policy, tools, identity, and verify-deploy e2e on loopback."""
+"""MCP server: bind policy, Host check, audit, and verify-deploy e2e on loopback."""
 
 from __future__ import annotations
 
@@ -7,13 +7,14 @@ import socket
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 import pytest
 
 from vault_search.client import Client
 from vault_search.config import Settings
-from tests.fake_whois import start_whois_socket
 
 REPO = Path(__file__).resolve().parents[1]
 VERIFY = REPO / "scripts" / "verify-deploy"
@@ -91,8 +92,6 @@ def test_verify_deploy_against_loopback_server(tmp_path: Path) -> None:
         assert secret not in client.read_note(fixture_path)
         assert "[REDACTED:" in client.read_note(fixture_path)
 
-    sock = tmp_path / "tailscaled.sock"
-    stop = start_whois_socket(sock)
     audit = tmp_path / "audit.jsonl"
     port = _free_port()
     env = os.environ.copy()
@@ -103,7 +102,7 @@ def test_verify_deploy_against_loopback_server(tmp_path: Path) -> None:
             "LISTEN_HOST": "127.0.0.1",
             "LISTEN_PORT": str(port),
             "MCP_PATH": "/vault/mcp",
-            "TAILSCALED_SOCKET": str(sock),
+            "PUBLIC_BASE_URL": "https://box.example.ts.net",
             "AUDIT_LOG_PATH": str(audit),
             "PYTHONPATH": str(REPO),
         }
@@ -150,7 +149,10 @@ def test_verify_deploy_against_loopback_server(tmp_path: Path) -> None:
         assert secret not in verify.stderr
         log = audit.read_text(encoding="utf-8")
         assert "read_note" in log
-        assert "fixture-device" in log
+        assert '"client_ip": "127.0.0.1"' in log
+        # The proxied MagicDNS Host is accepted; an unknown Host still gets 421.
+        assert _initialize_status(port, "box.example.ts.net") == 200
+        assert _initialize_status(port, "attacker.example") == 421
         assert secret not in log
         assert "[REDACTED:" not in log or "masked_hits" in log
     finally:
@@ -159,4 +161,24 @@ def test_verify_deploy_against_loopback_server(tmp_path: Path) -> None:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             proc.kill()
-        stop.set()
+
+
+def _initialize_status(port: int, host: str) -> int:
+    body = (
+        b'{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18",'
+        b'"capabilities":{},"clientInfo":{"name":"test","version":"0"}}}'
+    )
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{port}/vault/mcp",
+        data=body,
+        headers={
+            "Host": host,
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            return response.status
+    except urllib.error.HTTPError as exc:
+        return exc.code

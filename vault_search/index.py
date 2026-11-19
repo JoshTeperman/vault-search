@@ -363,13 +363,37 @@ def _resolve_links(conn: sqlite3.Connection) -> None:
         )
 
 
+def _file_id(path: Path) -> tuple[int, int] | None:
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino)
+
+
 class Index:
     def __init__(self, settings: Settings):
         self.settings = settings
-        self.conn = open_index(settings.index_path)
+        self._conn = open_index(settings.index_path)
+        self._file_id = _file_id(settings.index_path)
+
+    @property
+    def conn(self) -> sqlite3.Connection:
+        """The open connection, reopened if another process replaced the file.
+
+        A schema rebuild (for example by the sync timer after an update)
+        deletes and recreates the index file. A long-running server would
+        otherwise keep reading the deleted file until restarted.
+        """
+        current = _file_id(self.settings.index_path)
+        if current is not None and current != self._file_id:
+            self._conn.close()
+            self._conn = open_index(self.settings.index_path)
+            self._file_id = _file_id(self.settings.index_path)
+        return self._conn
 
     def close(self) -> None:
-        self.conn.close()
+        self._conn.close()
 
     def __enter__(self) -> Index:
         return self

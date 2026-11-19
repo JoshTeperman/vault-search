@@ -11,12 +11,13 @@ from typing import Any
 from vault_search.audit import append_event
 from vault_search.client import Client
 from vault_search.config import ConfigError, Settings, assert_bind_host
-from vault_search.identity import Caller, WhoIsFn, resolve_caller, whois_lookup
+from vault_search.identity import Caller, resolve_caller
 
 
 try:
     from mcp.server import MCPServer
     from mcp.server.mcpserver.context import Context
+    from mcp.server.transport_security import TransportSecuritySettings
 except ImportError:  # pragma: no cover - exercised via ConfigError in build_server
     MCPServer = None  # type: ignore[assignment, misc]
     Context = object  # type: ignore[assignment, misc]
@@ -100,25 +101,26 @@ def _tags(value: str | Sequence[str] | None) -> list[str] | None:
     return items or None
 
 
-def _whois_fn(settings: Settings, override: WhoIsFn | None) -> WhoIsFn:
-    if override is not None:
-        return override
-    return lambda addr: whois_lookup(addr, settings.tailscaled_socket)
-
-
-def _authorize(
-    ctx: Any,
-    *,
-    settings: Settings,
-    whois: WhoIsFn,
-) -> Caller:
+def _authorize(ctx: Any) -> Caller:
     headers, peer = _headers_and_peer(ctx)
-    return resolve_caller(
-        headers=headers,
-        peer=peer,
-        denylist=settings.denylist,
-        whois=whois,
-        socket_path=settings.tailscaled_socket,
+    return resolve_caller(headers=headers, peer=peer)
+
+
+def transport_security(settings: Settings) -> TransportSecuritySettings:
+    """Keep the SDK's DNS-rebinding check, but also accept the public host.
+
+    The SDK only allows localhost Host headers on a loopback bind, so a request
+    proxied with the MagicDNS name would get 421. PUBLIC_BASE_URL names it.
+    """
+    hosts = ["127.0.0.1:*", "localhost:*", "[::1]:*"]
+    origins = ["http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*"]
+    if settings.public_host:
+        hosts += [settings.public_host, f"{settings.public_host}:*"]
+        origins.append(f"https://{settings.public_host}")
+    return TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=hosts,
+        allowed_origins=origins,
     )
 
 
@@ -146,19 +148,17 @@ def build_server(
     settings: Settings,
     *,
     client: Client | None = None,
-    whois: WhoIsFn | None = None,
 ):
     if MCPServer is None or Context is object:
         raise ConfigError(
-            "the official MCP SDK is not installed; run pip install 'mcp>=2.0'"
+            "the official MCP SDK is not installed; reinstall the package (pip install -e .)"
         )
 
     vault = client or Client(settings)
-    lookup = _whois_fn(settings, whois)
     server = MCPServer(name="vault-search", version="0.1.0")
 
     def _gate(ctx: Context) -> tuple[Caller, str | None]:
-        caller = _authorize(ctx, settings=settings, whois=lookup)
+        caller = _authorize(ctx)
         if not caller.allowed:
             return caller, UNAUTHORIZED
         return caller, None
@@ -254,15 +254,15 @@ def serve(
     settings: Settings,
     *,
     client: Client | None = None,
-    whois: WhoIsFn | None = None,
 ) -> None:
     host = assert_bind_host(settings.listen_host, settings.listen_allow_nonlocal)
-    server, _vault = build_server(settings, client=client, whois=whois)
+    server, _vault = build_server(settings, client=client)
     server.run(
         transport="streamable-http",
         host=host,
         port=settings.listen_port,
         streamable_http_path=settings.mcp_path,
+        transport_security=transport_security(settings),
     )
 
 
