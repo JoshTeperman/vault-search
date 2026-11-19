@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlparse
 
 from vault_search.embed import DEFAULT_MODEL
 
@@ -13,7 +14,6 @@ _TRUE = {"1", "true", "yes", "on"}
 DEFAULT_LISTEN_HOST = "127.0.0.1"
 DEFAULT_LISTEN_PORT = 8787
 DEFAULT_MCP_PATH = "/vault/mcp"
-DEFAULT_TAILSCALED_SOCKET = Path("/var/run/tailscale/tailscaled.sock")
 NONLOCAL_BIND_HOSTS = frozenset({"0.0.0.0", "::", "[::]", "*"})
 
 
@@ -68,32 +68,11 @@ def _int_from_env(name: str, default: int) -> int:
         return default
 
 
-def _csv(raw: str | None) -> tuple[str, ...]:
-    if not raw:
-        return ()
-    return tuple(part.strip() for part in raw.split(",") if part.strip())
-
-
-def load_denylist(path: Path | None, extra: tuple[str, ...] = ()) -> tuple[str, ...]:
-    items: list[str] = list(extra)
-    if path is not None and path.is_file():
-        try:
-            text = path.read_text(encoding="utf-8")
-        except OSError:
-            text = ""
-        for line in text.splitlines():
-            entry = line.strip()
-            if entry and not entry.startswith("#"):
-                items.append(entry)
-    seen: set[str] = set()
-    unique: list[str] = []
-    for item in items:
-        key = item.casefold()
-        if key in seen:
-            continue
-        seen.add(key)
-        unique.append(item)
-    return tuple(unique)
+def public_host_from_url(raw: str | None) -> str | None:
+    """Host part of PUBLIC_BASE_URL, ignoring the <placeholder> left from .env.example."""
+    if not raw or "<" in raw:
+        return None
+    return urlparse(raw.strip()).hostname or None
 
 
 def assert_bind_host(host: str, allow_nonlocal: bool = False) -> str:
@@ -130,11 +109,8 @@ class Settings:
     listen_port: int = DEFAULT_LISTEN_PORT
     mcp_path: str = DEFAULT_MCP_PATH
     listen_allow_nonlocal: bool = False
-    tailscaled_socket: Path = DEFAULT_TAILSCALED_SOCKET
-    identity_source: str = "whois"
+    public_host: str | None = None
     audit_log_path: Path | None = None
-    denylist_path: Path | None = None
-    denylist: tuple[str, ...] = field(default_factory=tuple)
 
     @classmethod
     def from_env(
@@ -152,7 +128,6 @@ class Settings:
             raise ConfigError("set VAULT_ROOT or VAULT_PATH to the vault checkout")
         if db is None:
             db = Path.cwd() / "index" / "vault.db"
-        denylist_path = _path_from_env("DENYLIST_PATH")
         cache = _path_from_env("EMBEDDING_CACHE_DIR")
         if cache is not None:
             cache = cache.expanduser()
@@ -162,7 +137,6 @@ class Settings:
         audit = _path_from_env("AUDIT_LOG_PATH")
         if audit is not None:
             audit = audit.expanduser()
-        socket = _path_from_env("TAILSCALED_SOCKET") or DEFAULT_TAILSCALED_SOCKET
         host = os.environ.get("LISTEN_HOST") or os.environ.get("MCP_HOST") or DEFAULT_LISTEN_HOST
         allow = _truthy("LISTEN_ALLOW_NONLOCAL", False)
         return cls(
@@ -177,11 +151,8 @@ class Settings:
             listen_port=_int_from_env("LISTEN_PORT", _int_from_env("MCP_PORT", DEFAULT_LISTEN_PORT)),
             mcp_path=normalize_mcp_path(os.environ.get("MCP_PATH")),
             listen_allow_nonlocal=allow,
-            tailscaled_socket=socket.expanduser(),
-            identity_source=(os.environ.get("IDENTITY_SOURCE") or "whois").strip() or "whois",
+            public_host=public_host_from_url(os.environ.get("PUBLIC_BASE_URL")),
             audit_log_path=audit,
-            denylist_path=denylist_path,
-            denylist=load_denylist(denylist_path, _csv(os.environ.get("DENYLIST"))),
         )
 
     @staticmethod

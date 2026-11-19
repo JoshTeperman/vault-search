@@ -66,9 +66,7 @@ def append_event(
     count = 0 if denied else result_count(tool, result_text)
     event = {
         "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "device": caller.device,
-        "node": caller.node,
-        "tags": list(caller.tags),
+        "client_ip": caller.ip,
         "agent_name_unverified": caller.agent_name_unverified,
         "tool": tool,
         "args": summarize_args(args),

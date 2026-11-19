@@ -250,3 +250,21 @@ def test_chunk_body_preamble_and_levels() -> None:
     assert chunks[-1].heading == "C"
     # B is closed before C
     assert all("cc" not in c.text for c in chunks if c.heading == "B")
+
+
+def test_long_running_client_follows_a_rebuilt_index_file(tmp_path: Path) -> None:
+    """A schema rebuild by another process replaces the file; readers must follow it."""
+    from vault_search.index import remove_index_files
+
+    settings = Settings(vault_root=FIXTURES, index_path=tmp_path / "index.db")
+    with Client(settings, autoload=False) as server:
+        server.reindex()
+        assert "**alpha**" in server.list_projects()
+        # The sync timer deletes the file and recreates it empty, then refills it.
+        remove_index_files(settings.index_path)
+        with Client(settings, autoload=False):
+            pass
+        assert server.list_notes() == "No notes."
+        with Client(settings, autoload=False) as sync:
+            sync.reindex()
+        assert "**alpha**" in server.list_projects()
