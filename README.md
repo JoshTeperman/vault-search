@@ -1,6 +1,6 @@
 # vault-search
 
-Read-only search for a private knowledge vault, with a bundled MCP server. It is meant for coding agents: find a page or section, read only what is needed, and keep context small.
+Read-only search for a private knowledge vault, with a bundled, stateless MCP server. It is meant for coding agents: find a page or section, read only what is needed, and keep context small.
 
 This repository holds the search interface, the shared secret detector, a local FTS5 indexer with optional hybrid search, and a Streamable HTTP MCP server. The vault itself is a separate private checkout and is never committed here.
 
