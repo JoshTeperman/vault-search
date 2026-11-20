@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import socket
 import subprocess
@@ -153,6 +154,13 @@ def test_verify_deploy_against_loopback_server(tmp_path: Path) -> None:
         # The proxied MagicDNS Host is accepted; an unknown Host still gets 421.
         assert _initialize_status(port, "box.example.ts.net") == 200
         assert _initialize_status(port, "attacker.example") == 421
+        # Stateless + JSON: a bare tools/call with no initialize, no session and
+        # JSON-only Accept gets one plain JSON body and no session ID.
+        status, ctype, session, payload = _bare_tools_call(port)
+        assert status == 200
+        assert ctype.startswith("application/json")
+        assert session is None
+        assert payload["id"] == 1 and "result" in payload
         assert secret not in log
         assert "[REDACTED:" not in log or "masked_hits" in log
     finally:
@@ -161,6 +169,22 @@ def test_verify_deploy_against_loopback_server(tmp_path: Path) -> None:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             proc.kill()
+
+
+def _bare_tools_call(port: int) -> tuple[int, str, str | None, dict]:
+    body = b'{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_projects","arguments":{}}}'
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{port}/vault/mcp",
+        data=body,
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=5) as response:
+        return (
+            response.status,
+            response.headers.get("Content-Type", ""),
+            response.headers.get("Mcp-Session-Id"),
+            json.loads(response.read()),
+        )
 
 
 def _initialize_status(port: int, host: str) -> int:
