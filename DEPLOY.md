@@ -1,6 +1,6 @@
 # Deploying vault-search
 
-Runbook for the agent that deploys this service on the VPS (Josh's Claude). Vault Keeper owns the design and the code in this repository; you pull a release and run it. You do not change product behaviour here.
+Runbook for the agent that deploys this service on the VPS (Josh's Claude). Vault Keeper owns the design and the code in this repository; you pull a release and run it. You do not change product behaviour here. The design is in [SPEC.md](SPEC.md).
 
 The MCP HTTP server, the search index, and the pull-only vault sync are not in milestone 1. Steps that need them are marked **available from milestone N**. You can still do the prerequisite checks, create the service user and directories, and clone this public repo now.
 
