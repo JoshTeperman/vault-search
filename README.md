@@ -1,6 +1,6 @@
 # vault-search
 
-Read-only search for a private knowledge vault, with a bundled MCP server. It is meant for coding agents: find a page or section, read only what is needed, and keep context small.
+Read-only search for a private knowledge vault, with a bundled, stateless MCP server. It is meant for coding agents: find a page or section, read only what is needed, and keep context small.
 
 This repository holds the search interface, the shared secret detector, a local FTS5 indexer with optional hybrid search, and a Streamable HTTP MCP server. The vault itself is a separate private checkout and is never committed here.
 
@@ -39,6 +39,86 @@ A GitHub Actions workflow runs the tests and [gitleaks](https://github.com/gitle
 pre-commit install
 pre-commit run --all-files
 ```
+
+## MCP
+
+`python -m vault_search.mcp` runs one MCP server named `vault-search`. It listens on `LISTEN_HOST:LISTEN_PORT` (default `127.0.0.1:8787`) at `MCP_PATH` (default `/vault/mcp`). It refuses a wildcard bind unless `LISTEN_ALLOW_NONLOCAL=1` is set.
+
+```text
+POST {MCP_PATH}            JSON-RPC 2.0 in, one JSON body out
+├── search                 query, mode, project, tags, type, limit (8, max 20), after
+├── read_note              path, section
+├── list_notes             project, tags, type, limit (20, max 100), after
+└── list_projects          no arguments
+```
+
+All four tools are read-only and return compact markdown with secrets masked. `after` is the last path from the previous page. `tags` is a comma-separated string. The full tool contract is in [SPEC.md](SPEC.md).
+
+### Stateless
+
+The server keeps no session and does not stream. Each POST is independent and gets one `application/json` reply:
+
+- There is no `initialize` call and no `Mcp-Session-Id`. A script sends `tools/call` directly.
+- A restart or redeploy does not break connected clients.
+- There are no server-to-client messages (progress, sampling, elicitation). No tool needs them.
+
+The transport is still Streamable HTTP, the current MCP HTTP transport, so standard MCP clients connect as usual. They still send `initialize`, and the server answers it.
+
+### Access and audit
+
+Access control is the network: the app and nginx listen on loopback only, and only the tailnet reaches nginx. There is no token. The server checks the `Host` header against `PUBLIC_BASE_URL` (other hosts get `421`) and denies requests marked as Funnel traffic. Each tool call is appended to `AUDIT_LOG_PATH` with the client IP and the optional, unverified `X-Vault-Agent-Name` header.
+
+### Usage
+
+Set the URL in your shell. Never commit a real hostname.
+
+```bash
+export VAULT_MCP_URL='https://<vps>.<tailnet>.ts.net/vault/mcp'   # or http://127.0.0.1:8787/vault/mcp locally
+
+mcp() {
+  curl -fsS "$VAULT_MCP_URL" \
+    -H 'Content-Type: application/json' \
+    -H 'Accept: application/json' \
+    -H 'X-Vault-Agent-Name: my-script' \
+    -d "$1"
+}
+```
+
+List the tools:
+
+```bash
+mcp '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+```
+
+Search, then read one section of a hit:
+
+```bash
+mcp '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"search","arguments":{"query":"evals","project":"alpha","limit":5}}}'
+mcp '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"read_note","arguments":{"path":"wiki/concepts/evals.md","section":"Scoring"}}}'
+```
+
+Page through notes and list projects:
+
+```bash
+mcp '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_notes","arguments":{"tags":"evals,howto","limit":20}}}'
+mcp '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_notes","arguments":{"tags":"evals,howto","after":"<last path from page 1>"}}}'
+mcp '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_projects","arguments":{}}}'
+```
+
+The markdown is in `result.content[0].text`. To print only that text:
+
+```bash
+mcp '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_projects","arguments":{}}}' \
+  | jq -r '.result.content[0].text'
+```
+
+Add the server to Claude Code:
+
+```bash
+claude mcp add --transport http vault-search "$VAULT_MCP_URL"
+```
+
+`scripts/verify-deploy` runs the post-deploy checks against the same URL. See [DEPLOY.md](DEPLOY.md).
 
 ## Connect
 

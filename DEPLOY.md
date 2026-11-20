@@ -589,20 +589,16 @@ Claude's passing output is not acceptance. Vault Keeper re-runs these checks fro
    python3 /path/to/vault-search/scripts/verify-deploy
    ```
 
-   Manual equivalent (Streamable HTTP; capture any `Mcp-Session-Id` from initialize and send it back on `tools/list`):
+   Manual equivalent. The server is stateless and answers in plain JSON, so one POST is enough: no `initialize`, no `Mcp-Session-Id`, no SSE:
 
    ```bash
    curl -fsS https://<vps>.<tailnet>.ts.net/vault/mcp \
      -H 'Content-Type: application/json' \
-     -H 'Accept: application/json, text/event-stream' \
-     -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2026-07-28","capabilities":{},"clientInfo":{"name":"vault-search-verify","version":"0.1.0"}}}'
-   curl -fsS https://<vps>.<tailnet>.ts.net/vault/mcp \
-     -H 'Content-Type: application/json' \
-     -H 'Accept: application/json, text/event-stream' \
-     -d '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
+     -H 'Accept: application/json' \
+     -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
    ```
 
-   Expected: a JSON-RPC result (or SSE `data:` payload) whose `tools` names are exactly those four tools. A connection failure or an empty/error result is a fail.
+   Expected: a JSON-RPC result whose `tools` names are exactly those four tools. A connection failure or an empty/error result is a fail.
 
 3. **A sample query returns masked output for a synthetic secret fixture.** Create the fixture on the VPS at verify time only: a temporary note the index can see, containing a token **assembled at runtime** (not a committed secret, not a real credential). Do not commit the fixture to the vault or to this repo. Then call `read_note` or `search` on that path (the verify script does this when `VERIFY_FIXTURE_PATH` and `VERIFY_SYNTHETIC_SECRET` are set in the shell). Expected: the response contains `[REDACTED:` and does **not** contain the raw token. Remove the fixture afterwards.
 

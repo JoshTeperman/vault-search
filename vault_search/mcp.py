@@ -262,6 +262,8 @@ def serve(
         host=host,
         port=settings.listen_port,
         streamable_http_path=settings.mcp_path,
+        stateless_http=True,
+        json_response=True,
         transport_security=transport_security(settings),
     )
 
